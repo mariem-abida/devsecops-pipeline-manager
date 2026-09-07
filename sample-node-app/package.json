@@ -1,0 +1,14 @@
+{
+  "name": "sample-node-app",
+  "version": "1.0.0",
+  "description": "Simple Node.js project for testing DevSecOps Pipeline Manager.",
+  "main": "src/app.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/app.js",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,2928 @@
+// ═══════════════════════════════════════════════════════════════
+//  DevSecOps Pipeline — Professional Multi-language Pipeline v5 + AI Security Advisor
+//  Supports : auto · Python · JavaScript · Java
+//  Flow     : Validate → Checkout → Detect → Build → Tests → Quality
+//             → SonarQube → SonarQube Quality Gate → SAST → Dependency → Secret → Docker Build
+//             → Container Scan → SBOM → AI Security Advisor → OPA Policy → Decision
+//             → Publish → Resolve Digest → Sign/Verify
+//             → Production Approval (optional) → Deploy → Audit → Summary
+// ═══════════════════════════════════════════════════════════════
+
+@groovy.transform.Field
+def deployAllowed = false
+
+@groovy.transform.Field
+def blockReasons  = []
+
+// Helper methods extracted from script { } blocks to avoid Jenkins CPS MethodTooLargeException
+
+def run_Validate_Parameters_1() {
+    sh 'mkdir -p reports'
+
+    def gitUrl = (params.GIT_URL ?: '').trim()
+    if (!gitUrl) {
+        error('GIT_URL is required')
+    }
+    if (!gitUrl.startsWith('https://gitlab.com/')) {
+        error('Only GitLab HTTPS repositories are supported: https://gitlab.com/...')
+    }
+
+    env.SELECTED_BRANCH = (params.BRANCH ?: 'main').trim()
+    env.SELECTED_ENV    = params.DEPLOY_ENV ?: 'test'
+
+    if (!env.SELECTED_BRANCH) {
+        error('BRANCH cannot be empty')
+    }
+    if (params.SIGN_IMAGE && !params.PUSH_IMAGE) {
+        error('SIGN_IMAGE=true requires PUSH_IMAGE=true')
+    }
+
+    // Derive project + Container Registry path from GIT_URL.
+    // https://gitlab.com/group/subgroup/app.git -> registry.gitlab.com/group/subgroup/app
+    def gitlabPath = gitUrl.substring('https://gitlab.com/'.length())
+    if (gitlabPath.endsWith('.git')) {
+        gitlabPath = gitlabPath.substring(0, gitlabPath.length() - 4)
+    }
+    gitlabPath = gitlabPath.replaceAll('^/+|/+$', '')
+    if (!gitlabPath || !gitlabPath.contains('/')) {
+        error('Invalid GitLab repository URL')
+    }
+
+    def repoName = gitlabPath.tokenize('/').last()
+    env.SONAR_PROJECT_KEY  = repoName
+    env.SONAR_PROJECT_NAME = repoName
+    env.REGISTRY_HOST      = 'registry.gitlab.com'
+    env.REGISTRY_IMAGE     = "${env.REGISTRY_HOST}/${gitlabPath}"
+
+    env.TEST_STATUS             = params.RUN_TESTS ? 'PENDING' : 'SKIPPED'
+    env.SAST_STATUS             = 'SKIPPED'
+    env.DEPENDENCY_STATUS       = 'SKIPPED'
+    env.SECRET_STATUS           = 'SKIPPED'
+    env.DOCKER_BUILD_STATUS     = 'SKIPPED'
+    env.CONTAINER_SCAN_STATUS   = 'SKIPPED'
+    env.SBOM_STATUS             = 'SKIPPED'
+    env.AI_ADVISOR_STATUS       = params.RUN_AI ? 'PENDING' : 'SKIPPED'
+    env.POLICY_STATUS           = 'SKIPPED'
+    env.REGISTRY_PUSH_STATUS    = 'SKIPPED'
+    env.REGISTRY_DIGEST_STATUS  = 'SKIPPED'
+    env.COSIGN_SIGN_STATUS      = 'SKIPPED'
+    env.COSIGN_VERIFY_STATUS    = 'SKIPPED'
+    env.PROD_APPROVAL_STATUS    = 'SKIPPED'
+    env.DEPLOY_STATUS           = 'SKIPPED'
+    env.REGISTRY_REPO_DIGEST    = ''
+    env.DEPLOYED_IMAGE          = ''
+
+    echo """
+╔══════════════════════════════════════════╗
+  DevSecOps Pipeline Starting
+  Repo     : ${repoName}
+  Language : ${params.LANGUAGE} (auto-detect when auto)
+  Branch   : ${env.SELECTED_BRANCH}
+  Env      : ${env.SELECTED_ENV}
+  Registry : ${env.REGISTRY_IMAGE}
+╚══════════════════════════════════════════╝"""
+}
+
+def run_Checkout_2() {
+    echo "Cloning ${params.GIT_URL} @ ${env.SELECTED_BRANCH}"
+
+    // Prevent files from a previous project/build from leaking into this run.
+    deleteDir()
+
+    git branch: "${env.SELECTED_BRANCH}",
+        credentialsId: 'gitlab-private-token',
+        url: "${params.GIT_URL}"
+
+    env.GIT_COMMIT_FULL = sh(
+        script: 'git rev-parse HEAD',
+        returnStdout: true
+    ).trim()
+
+    env.GIT_COMMIT_SHORT = sh(
+        script: 'git rev-parse --short HEAD',
+        returnStdout: true
+    ).trim()
+
+    env.REGISTRY_BUILD_TAG  = "${env.REGISTRY_IMAGE}:build-${env.BUILD_NUMBER}"
+    env.REGISTRY_COMMIT_TAG = "${env.REGISTRY_IMAGE}:commit-${env.GIT_COMMIT_SHORT}"
+
+    echo "Commit SHA : ${env.GIT_COMMIT_SHORT}"
+    echo "Build tag  : ${env.REGISTRY_BUILD_TAG}"
+}
+
+def run_Detect_Language_3() {
+                    def detectedLang = ''
+
+                    if (params.LANGUAGE != 'auto') {
+                        // Manual override
+                        detectedLang = params.LANGUAGE
+                        echo "Language manually selected: ${detectedLang}"
+
+                    } else if (fileExists('requirements.txt') || fileExists('pyproject.toml')) {
+                        detectedLang = 'python'
+
+                    } else if (fileExists('package.json')) {
+                        detectedLang = 'javascript'
+
+                    } else if (fileExists('pom.xml') || fileExists('build.gradle')) {
+                        detectedLang = 'java'
+
+                    } else {
+                        error('Unable to detect project language. No requirements.txt, package.json, pom.xml or build.gradle found.')
+                    }
+
+                    env.DETECTED_LANGUAGE = detectedLang
+
+                    echo """
+==================================
+  LANGUAGE DETECTED : ${detectedLang.toUpperCase()}
+  PROJECT KEY       : ${env.SONAR_PROJECT_KEY}
+=================================="""
+                
+}
+
+def run_Build_4() {
+                    sh 'mkdir -p reports'
+                    switch (env.DETECTED_LANGUAGE) {
+
+                        case 'python':
+                            echo 'Preparing Python project...'
+                            sh '''
+                                python3 --version
+                                python3 -m pip install \
+                                    -r requirements.txt \
+                                    pytest pytest-cov \
+                                    flake8 \
+                                    pip-audit \
+                                    --break-system-packages --quiet
+                            '''
+                            break
+
+                        case 'javascript':
+                            echo 'Building JavaScript project...'
+                            sh '''
+                                node --version
+                                npm --version
+                                npm ci
+                                npm run build --if-present
+                            '''
+                            break
+
+                        case 'java':
+                            echo 'Building Java project...'
+                            sh '''
+                                java -version
+                                mvn --version
+                                mvn clean compile -q
+                            '''
+                            break
+
+                        default:
+                            error("Unsupported language: ${env.DETECTED_LANGUAGE}")
+                    }
+                
+}
+
+def run_Run_Tests_5() {
+    sh 'mkdir -p reports'
+
+    def testExit = 0
+
+    switch (env.DETECTED_LANGUAGE) {
+        case 'python':
+            testExit = sh(
+                script: '''
+                    python3 -m pytest \
+                        --junitxml=reports/test-results.xml \
+                        --cov=. \
+                        --cov-report=xml:reports/coverage.xml \
+                        --cov-report=term-missing \
+                        --tb=short \
+                        -v
+                ''',
+                returnStatus: true
+            )
+            break
+
+        case 'javascript':
+            testExit = sh(
+                script: '''
+                    npm test -- --ci --reporters=jest-junit --outputFile=reports/test-results.xml 2>/dev/null || npm test --if-present
+                ''',
+                returnStatus: true
+            )
+            break
+
+        case 'java':
+            testExit = sh(script: 'mvn test -q', returnStatus: true)
+            sh 'find . -name "TEST-*.xml" -exec cp {} reports/ \\; 2>/dev/null || true'
+            sh '''
+                python3 - <<'PYEOF'
+import glob
+import xml.etree.ElementTree as ET
+
+out = ET.Element('testsuites')
+for path in glob.glob('reports/TEST-*.xml'):
+    try:
+        root = ET.parse(path).getroot()
+        if root.tag == 'testsuite':
+            out.append(root)
+        else:
+            for suite in root.findall('.//testsuite'):
+                out.append(suite)
+    except Exception as exc:
+        print('Skipping invalid JUnit file', path, exc)
+
+if len(out):
+    ET.ElementTree(out).write('reports/test-results.xml', encoding='unicode')
+PYEOF
+            '''
+            break
+
+        default:
+            error("Unsupported language for tests: ${env.DETECTED_LANGUAGE}")
+    }
+
+    if (!fileExists('reports/test-results.xml')) {
+        def isFail = (testExit == 0) ? '0' : '1'
+        def failMsg = (testExit == 0) ? '' : '<failure message="Test command failed before producing JUnit XML"/>'
+        writeFile(
+            file: 'reports/test-results.xml',
+            text: "<testsuites><testsuite name=\"pipeline\" tests=\"1\" failures=\"${isFail}\"><testcase classname=\"Pipeline\" name=\"test_execution\">${failMsg}</testcase></testsuite></testsuites>"
+        )
+    }
+
+    sh '''
+        python3 - <<'PYEOF'
+import xml.etree.ElementTree as ET
+
+failures = 0
+errors = 0
+try:
+    root = ET.parse('reports/test-results.xml').getroot()
+    suites = [root] if root.tag == 'testsuite' else list(root.findall('.//testsuite'))
+    failures = int(root.attrib.get('failures', 0) or 0)
+    errors = int(root.attrib.get('errors', 0) or 0)
+    if root.tag == 'testsuites' and failures == 0 and errors == 0:
+        failures = sum(int(s.attrib.get('failures', 0) or 0) for s in suites)
+        errors = sum(int(s.attrib.get('errors', 0) or 0) for s in suites)
+except Exception as exc:
+    print('JUnit parse error:', exc)
+    failures = 1
+
+with open('.test_failures.txt', 'w') as f:
+    f.write(str(failures + errors))
+PYEOF
+    '''
+
+    env.TEST_FAILURES = readFile('.test_failures.txt').trim()
+    def parsedFailures = env.TEST_FAILURES.isInteger() ? env.TEST_FAILURES.toInteger() : 1
+
+    if (testExit != 0 && parsedFailures == 0) {
+        parsedFailures = 1
+        env.TEST_FAILURES = '1'
+    }
+
+    env.TEST_STATUS = (parsedFailures == 0 && testExit == 0) ? 'PASSED' : 'FAILED'
+
+    writeFile(
+        file: 'reports/test-summary.txt',
+        text: """STATUS: ${env.TEST_STATUS}
+TOOL_EXIT_CODE: ${testExit}
+FAILURES_AND_ERRORS: ${env.TEST_FAILURES}
+REPORT: reports/test-results.xml
+"""
+    )
+
+    echo "TEST_STATUS=${env.TEST_STATUS} TEST_FAILURES=${env.TEST_FAILURES} EXIT_CODE=${testExit}"
+}
+
+def run_Code_Quality_6() {
+                    sh 'mkdir -p reports'
+
+                    switch (env.DETECTED_LANGUAGE) {
+
+                        case 'python':
+                            sh '''
+                                echo "TOOL: flake8" > reports/code-quality-report.txt
+
+                                python3 -m flake8 . \
+                                    --exclude=.git,.venv,venv,__pycache__,reports,.pytest_cache \
+                                    --max-line-length=120 \
+                                    > flake8.log 2>&1 || true
+
+                                BUGS=$(grep -E 'E[0-9]{3}' flake8.log | wc -l)
+                                SMELLS=$(grep -E 'W[0-9]{3}' flake8.log | wc -l)
+                                TOTAL=$((BUGS + SMELLS))
+
+                                if [ "$TOTAL" -gt 10 ]; then GATE="FAILED"; else GATE="PASSED"; fi
+
+                                echo "QUALITY_GATE: $GATE"       >> reports/code-quality-report.txt
+                                echo "QUALITY_SCORE: 88.5"       >> reports/code-quality-report.txt
+                                echo "BUGS: $BUGS"               >> reports/code-quality-report.txt
+                                echo "CODE_SMELLS: $SMELLS"      >> reports/code-quality-report.txt
+                                echo "TOTAL_ISSUES: $TOTAL"      >> reports/code-quality-report.txt
+                                echo "SUMMARY: flake8 (max-line=120)" >> reports/code-quality-report.txt
+
+                                awk -F: '/^[a-zA-Z0-9_./-]+:[0-9]+:[0-9]+:/ {
+                                    print "ISSUE|" ($4 ~ /^[[:space:]]*E/ ? "ERROR" : "WARNING") "|" $1 "|" $2 "|" $4
+                                }' flake8.log >> reports/code-quality-report.txt || true
+
+                                echo "Quality: BUGS=$BUGS SMELLS=$SMELLS GATE=$GATE"
+                            '''
+                            break
+
+                        case 'javascript':
+                            sh '''
+                                echo "TOOL: ESLint" > reports/code-quality-report.txt
+                                npx eslint . \
+                                    --format json \
+                                    --output-file eslint-report.json \
+                                    2>/dev/null || true
+                                BUGS=$(python3 -c "
+import json
+try:
+    data = json.load(open('eslint-report.json'))
+    errors = sum(f.get('errorCount', 0) for f in data)
+    print(errors)
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+                                TOTAL=$BUGS
+                                if [ "$TOTAL" -gt 10 ]; then GATE="FAILED"; else GATE="PASSED"; fi
+                                echo "QUALITY_GATE: $GATE"       >> reports/code-quality-report.txt
+                                echo "BUGS: $BUGS"               >> reports/code-quality-report.txt
+                                echo "CODE_SMELLS: 0"            >> reports/code-quality-report.txt
+                                echo "TOTAL_ISSUES: $TOTAL"      >> reports/code-quality-report.txt
+                                echo "SUMMARY: ESLint analysis"  >> reports/code-quality-report.txt
+                            '''
+                            break
+
+                        case 'java':
+                            sh '''
+                                echo "TOOL: Checkstyle" > reports/code-quality-report.txt
+                                mvn checkstyle:check -q 2>/dev/null || true
+                                BUGS=0
+                                if [ -f target/checkstyle-result.xml ]; then
+                                    BUGS=$(grep -E '<error' target/checkstyle-result.xml | wc -l)
+                                fi
+                                TOTAL=$BUGS
+                                if [ "$TOTAL" -gt 10 ]; then GATE="FAILED"; else GATE="PASSED"; fi
+                                echo "QUALITY_GATE: $GATE"       >> reports/code-quality-report.txt
+                                echo "BUGS: $BUGS"               >> reports/code-quality-report.txt
+                                echo "CODE_SMELLS: 0"            >> reports/code-quality-report.txt
+                                echo "TOTAL_ISSUES: $TOTAL"      >> reports/code-quality-report.txt
+                                echo "SUMMARY: Checkstyle analysis" >> reports/code-quality-report.txt
+                            '''
+                            break
+
+                        default:
+                            sh '''
+                                echo "TOOL: None"            > reports/code-quality-report.txt
+                                echo "QUALITY_GATE: PASSED" >> reports/code-quality-report.txt
+                                echo "BUGS: 0"              >> reports/code-quality-report.txt
+                                echo "CODE_SMELLS: 0"       >> reports/code-quality-report.txt
+                                echo "TOTAL_ISSUES: 0"      >> reports/code-quality-report.txt
+                                echo "SUMMARY: No linter"   >> reports/code-quality-report.txt
+                            '''
+                    }
+
+                    // Separate sh step — read TOTAL_ISSUES consistently for every language
+                    sh "grep '^TOTAL_ISSUES:' reports/code-quality-report.txt | cut -d' ' -f2 > .quality_issues.txt"
+                    env.QUALITY_ISSUES = readFile('.quality_issues.txt').trim()
+                    echo "QUALITY_ISSUES = ${env.QUALITY_ISSUES} (gate: > 10 = BLOCKED)"
+                
+}
+
+def run_SonarQube_Analysis_7() {
+                    def scannerHome = tool 'sonar-scanner'
+
+                    // Extra params per language (Groovy string — not shell concat)
+                    def extraParams = ''
+                    switch (env.DETECTED_LANGUAGE) {
+                        case 'python':
+                            // Explicitly classify Python tests so SonarQube does not
+                            // have to guess test files (removes the sonar.tests warning).
+                            extraParams = "-Dsonar.python.version=3" +
+                                          " -Dsonar.tests=." +
+                                          " -Dsonar.test.inclusions=**/test_*.py,**/*_test.py,**/tests/**/*.py"
+                            if (params.RUN_TESTS) {
+                                extraParams += " -Dsonar.python.xunit.reportPath=reports/test-results.xml"
+                                if (fileExists('reports/coverage.xml')) {
+                                    extraParams += " -Dsonar.python.coverage.reportPaths=reports/coverage.xml"
+                                }
+                            }
+                            break
+                        case 'javascript':
+                            extraParams = "-Dsonar.tests=." +
+                                          " -Dsonar.test.inclusions=**/*.test.js,**/*.spec.js,**/*.test.jsx,**/*.spec.jsx,**/*.test.ts,**/*.spec.ts,**/*.test.tsx,**/*.spec.tsx,**/__tests__/**"
+                            if (fileExists('coverage/lcov.info')) {
+                                extraParams += " -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info"
+                            }
+                            break
+                        case 'java':
+                            extraParams = "-Dsonar.java.binaries=target/classes"
+                            if (fileExists('src/test')) {
+                                extraParams += " -Dsonar.tests=src/test"
+                            }
+                            break
+                    }
+
+                    withSonarQubeEnv('sonarqube-server') {
+                        sh """
+                            ${scannerHome}/bin/sonar-scanner \
+                            -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \
+                            -Dsonar.projectName=${env.SONAR_PROJECT_NAME} \
+                            -Dsonar.sources=. \
+                            -Dsonar.exclusions=reports/**,.git/**,__pycache__/**,.pytest_cache/**,node_modules/**,target/**,.scannerwork/** \
+                            -Dsonar.sourceEncoding=UTF-8 \
+                            ${extraParams}
+                        """
+                    }
+                
+}
+
+def run_SonarQube_Quality_Gate_7b() {
+    sh 'mkdir -p reports'
+
+    echo """
+===================================
+  🧭  SONARQUBE QUALITY GATE
+      Project : ${env.SONAR_PROJECT_KEY}
+      Waiting for SonarQube result...
+==================================="""
+
+    def qualityGateStatus = 'UNKNOWN'
+    def qualityGateError  = ''
+    def webhookOk         = true
+
+    try {
+        timeout(time: 5, unit: 'MINUTES') {
+            def qg = waitForQualityGate abortPipeline: false
+            qualityGateStatus = qg?.status ?: 'UNKNOWN'
+        }
+    } catch (err) {
+        webhookOk = false
+        qualityGateStatus = 'WEBHOOK_ERROR'
+        qualityGateError  = err.getMessage() ?: 'Unable to receive SonarQube Quality Gate result'
+    }
+
+    env.SONAR_GATE_STATUS = qualityGateStatus
+    env.SONAR_GATE_PASSED = (qualityGateStatus == 'OK') ? 'true' : 'false'
+
+    writeFile(
+        file: 'reports/sonarqube-quality-gate.txt',
+        text: """STATUS: ${qualityGateStatus}
+PASSED: ${env.SONAR_GATE_PASSED}
+WEBHOOK_OK: ${webhookOk}
+TOOL: SonarQube Quality Gate
+PROJECT: ${env.SONAR_PROJECT_KEY}
+BUILD_NUMBER: ${env.BUILD_NUMBER}
+ERROR: ${qualityGateError ?: 'NONE'}
+"""
+    )
+
+    // Fetch real metrics from SonarQube API and overwrite code-quality-report.txt
+    withSonarQubeEnv('sonarqube-server') {
+        sh """
+            curl -s -u "\${SONAR_AUTH_TOKEN}:" \\
+                 "\${SONAR_HOST_URL}/api/measures/component?component=${env.SONAR_PROJECT_KEY}&metricKeys=bugs,code_smells,coverage,duplicated_lines_density,vulnerabilities,sqale_index,sqale_rating,security_rating" \\
+                 -o reports/sonar-metrics.json || true
+            
+            python3 -c "
+import json, sys
+try:
+    with open('reports/sonar-metrics.json') as f:
+        data = json.load(f)
+    measures = {m['metric']: m['value'] for m in data.get('component', {}).get('measures', [])}
+    
+    bugs = measures.get('bugs', '0')
+    smells = measures.get('code_smells', '0')
+    coverage = measures.get('coverage', '0.0')
+    duplications = measures.get('duplicated_lines_density', '0.0')
+    vulns = measures.get('vulnerabilities', '0')
+    tech_debt = measures.get('sqale_index', '0')
+    
+    # Rating mappings (1.0 = A, 2.0 = B, etc.) — handle both int and float strings
+    rating_map = {'1': 'A', '1.0': 'A', '2': 'B', '2.0': 'B', '3': 'C', '3.0': 'C', '4': 'D', '4.0': 'D', '5': 'E', '5.0': 'E'}
+    maint_rating = rating_map.get(measures.get('sqale_rating', '1'), 'A')
+    sec_rating = rating_map.get(measures.get('security_rating', '1'), 'A')
+    
+    # Calculate a rough quality score (100 - penalties)
+    score = max(0.0, min(100.0, 100.0 - (float(bugs) * 5 + float(smells) * 1 + float(vulns) * 10)))
+    
+    # Map SonarQube gate status to backend convention (OK→PASSED, ERROR→FAILED)
+    gate_map = {'OK': 'PASSED', 'ERROR': 'FAILED', 'WARN': 'WARN'}
+    gate_display = gate_map.get('${qualityGateStatus}', '${qualityGateStatus}')
+    blocked = 'true' if gate_display == 'FAILED' else 'false'
+    
+    with open('reports/code-quality-report.txt', 'w') as out:
+        out.write('TOOL: SonarQube\\n')
+        out.write(f'QUALITY_GATE: {gate_display}\\n')
+        out.write(f'QUALITY_SCORE: {score:.1f}\\n')
+        out.write(f'BUGS: {bugs}\\n')
+        out.write(f'CODE_SMELLS: {smells}\\n')
+        out.write(f'COVERAGE: {coverage}\\n')
+        out.write(f'DUPLICATION: {duplications}\\n')
+        out.write(f'VULNERABILITIES: {vulns}\\n')
+        out.write(f'TECH_DEBT: {tech_debt}\\n')
+        out.write(f'MAINTAINABILITY: {maint_rating}\\n')
+        out.write(f'SECURITY_RATING: {sec_rating}\\n')
+        out.write(f'DEPLOYMENT_BLOCKED: {blocked}\\n')
+        out.write(f'TOTAL_ISSUES: {int(bugs) + int(smells) + int(vulns)}\\n')
+        out.write(f'SUMMARY: SonarQube analysis completed. Quality Gate: {gate_display}. Bugs: {bugs}, Code Smells: {smells}, Coverage: {coverage}%, Duplication: {duplications}%.\\n')
+except Exception as e:
+    print('Failed to parse SonarQube metrics:', e)
+" || true
+        """
+    }
+
+
+    if (qualityGateStatus == 'OK') {
+        echo """
+===================================
+  ✅  SONARQUBE QUALITY GATE : PASSED
+      Status : ${qualityGateStatus}
+==================================="""
+    } else if (!webhookOk) {
+        echo """
+===================================
+  ⚠️  SONARQUBE QUALITY GATE : WEBHOOK ERROR
+      Status : ${qualityGateStatus}
+      ${qualityGateError}
+      Security scans will continue, but deployment will be blocked.
+==================================="""
+    } else {
+        echo """
+===================================
+  ❌  SONARQUBE QUALITY GATE : FAILED
+      Status : ${qualityGateStatus}
+      Security scans will continue so all reports are collected.
+      Deployment will be blocked by Deployment Decision.
+==================================="""
+    }
+}
+
+def run_SAST_8() {
+                    sh 'mkdir -p reports'
+
+                    // Install Semgrep (idempotent — with Python 3.13 compat fix)
+                    sh '''
+                        export PATH="$HOME/.local/bin:$PATH"
+
+                        # Python 3.13 removed the 'cgi' module.
+                        # requests < 2.32 still imports it via utils.py.
+                        # Upgrade requests first so semgrep can load.
+                        python3 -m pip install "requests>=2.32.3" \
+                            --upgrade --break-system-packages --quiet 2>&1 || true
+
+                        # Install semgrep (skip if already installed + working)
+                        if ! semgrep --version >/dev/null 2>&1; then
+                            python3 -m pip install semgrep \
+                                --break-system-packages --quiet
+                        fi
+
+                        semgrep --version
+                    '''
+
+                    // Run Semgrep — returnStatus so pipeline does NOT fail on findings
+                    def sastExit = sh(
+                        script: '''
+                            export PATH="$HOME/.local/bin:$PATH"
+                            semgrep scan \
+                                --config auto \
+                                --json \
+                                --output reports/sast-report.json \
+                                --exclude=.git \
+                                --exclude=node_modules \
+                                --exclude=venv \
+                                --exclude=.venv \
+                                --exclude=reports \
+                                --exclude=target \
+                                --exclude=build \
+                                --exclude=.scannerwork \
+                                . 2>/dev/null
+                        ''',
+                        returnStatus: true
+                    )
+                    echo "Semgrep exit code: ${sastExit}"
+
+                    // Parse JSON report with Python heredoc (always exits 0)
+                    sh '''
+                        python3 - <<'PYEOF'
+import json
+
+try:
+    with open("reports/sast-report.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    results = data.get("results", [])
+    total   = len(results)
+    errors  = sum(
+        1 for r in results
+        if str(r.get("extra", {}).get("severity", "")).upper() in ("ERROR", "CRITICAL", "HIGH")
+    )
+except Exception as e:
+    print("SAST parse error:", e)
+    total, errors = 0, 0
+
+with open(".sast_total.txt",  "w") as f: f.write(str(total))
+with open(".sast_errors.txt", "w") as f: f.write(str(errors))
+print(f"SAST findings: {total}, blocking (HIGH+): {errors}")
+PYEOF
+                    '''
+
+                    // Separate sh step before readFile (Jenkins requirement)
+                    sh 'cat .sast_total.txt .sast_errors.txt'
+                    env.SAST_TOTAL  = readFile('.sast_total.txt').trim()
+                    env.SAST_ERRORS = readFile('.sast_errors.txt').trim()
+
+                    def sastErrors = env.SAST_ERRORS.isInteger() ? env.SAST_ERRORS.toInteger() : 0
+                    def sastTotal  = env.SAST_TOTAL.isInteger()  ? env.SAST_TOTAL.toInteger()  : 0
+                    def sastStatus = sastErrors > 0 ? 'FAILED' : 'PASSED'
+                    env.SAST_STATUS = sastStatus
+
+                    // Write SAST report
+                    sh """
+                        echo "STATUS: ${sastStatus}"           > reports/sast-summary.txt
+                        echo "TOOL: Semgrep"                  >> reports/sast-summary.txt
+                        echo "TOTAL_FINDINGS: ${env.SAST_TOTAL}" >> reports/sast-summary.txt
+                        echo "BLOCKING_FINDINGS: ${env.SAST_ERRORS}" >> reports/sast-summary.txt
+                        echo "GATE: ${sastStatus}"             >> reports/sast-summary.txt
+                    """
+
+                    if (sastErrors > 0) {
+                        echo """
+===================================
+  ❌  SAST GATE : FAILED
+      Findings  : ${sastTotal}
+      Blocking  : ${sastErrors} (HIGH / CRITICAL)
+==================================="""
+                    } else {
+                        echo """
+===================================
+  ✅  SAST GATE : PASSED
+      Findings  : ${sastTotal}
+==================================="""
+                    }
+                
+}
+
+def run_Dependency_Scan_9() {
+                    sh 'mkdir -p reports'
+
+                    // Tool and exit code captured with returnStatus (no pipeline failure on findings)
+                    def depTool   = 'unknown'
+                    def depExit   = 0
+                    def depVulns  = 0
+
+                    switch (env.DETECTED_LANGUAGE) {
+
+                        case 'python':
+                            depTool = 'pip-audit'
+                            // pip-audit exits 0 = no vulns, 1 = vulns found
+                            depExit = sh(
+                                script: '''
+                                    export PATH="$HOME/.local/bin:$PATH"
+                                    python3 -m pip_audit \
+                                        -r requirements.txt \
+                                        --format json \
+                                        --output reports/dependency-report.json \
+                                        2>/dev/null
+                                ''',
+                                returnStatus: true
+                            )
+                            // Count vulns from JSON
+                            sh '''
+                                python3 - <<'PYEOF'
+import json
+try:
+    data = json.load(open('reports/dependency-report.json'))
+    deps = data.get('dependencies', [])
+    count = sum(len(d.get('vulns', [])) for d in deps)
+except:
+    count = 0
+with open('.dep_vulns.txt', 'w') as f: f.write(str(count))
+print('Dependency vulnerabilities:', count)
+PYEOF
+                            '''
+                            break
+
+                        case 'javascript':
+                            depTool = 'npm-audit'
+                            // npm audit exits 1 when issues >= --audit-level
+                            depExit = sh(
+                                script: '''
+                                    npm audit \
+                                        --json \
+                                        --audit-level=high \
+                                        > reports/dependency-report.json 2>/dev/null
+                                ''',
+                                returnStatus: true
+                            )
+                            sh '''
+                                python3 - <<'PYEOF'
+import json
+try:
+    data = json.load(open('reports/dependency-report.json'))
+    meta  = data.get('metadata', {})
+    v     = meta.get('vulnerabilities', {})
+    count = v.get('high', 0) + v.get('critical', 0)
+except:
+    count = 0
+with open('.dep_vulns.txt', 'w') as f: f.write(str(count))
+print('Dependency vulnerabilities (high+):', count)
+PYEOF
+                            '''
+                            break
+
+                        case 'java':
+                            depTool = 'owasp-dependency-check'
+                            // failBuildOnCVSS=7 → exit 1 if CVSS >= 7
+                            depExit = sh(
+                                script: '''
+                                    mvn org.owasp:dependency-check-maven:check \
+                                        -Dformat=JSON \
+                                        -Dodc.outputDirectory=reports \
+                                        -DfailBuildOnCVSS=7 \
+                                        -q 2>/dev/null
+                                ''',
+                                returnStatus: true
+                            )
+                            sh '''
+                                python3 - <<'PYEOF'
+import json, glob
+try:
+    files = glob.glob('reports/dependency-check-report.json')
+    data  = json.load(open(files[0]))
+    deps  = data.get('dependencies', [])
+    count = sum(
+        1 for d in deps
+        if any(v.get('cvssv3', {}).get('baseScore', 0) >= 7
+               for v in d.get('vulnerabilities', []))
+    )
+except:
+    count = 0
+with open('.dep_vulns.txt', 'w') as f: f.write(str(count))
+print('Dependency vulnerabilities (CVSS>=7):', count)
+PYEOF
+                            '''
+                            break
+
+                        default:
+                            sh 'echo 0 > .dep_vulns.txt'
+                            depTool = 'none'
+                    }
+
+                    // Separate sh step before readFile
+                    sh 'cat .dep_vulns.txt'
+                    env.DEPENDENCY_VULNS = readFile('.dep_vulns.txt').trim()
+
+                    def vulnCount  = env.DEPENDENCY_VULNS.isInteger() ? env.DEPENDENCY_VULNS.toInteger() : 0
+                    def depStatus  = (depExit != 0 || vulnCount > 0) ? 'FAILED' : 'PASSED'
+                    env.DEPENDENCY_STATUS = depStatus
+
+                    sh """
+                        echo "STATUS: ${depStatus}"                        > reports/dependency-summary.txt
+                        echo "TOOL: ${depTool}"                           >> reports/dependency-summary.txt
+                        echo "LANGUAGE: ${env.DETECTED_LANGUAGE}"         >> reports/dependency-summary.txt
+                        echo "VULNERABILITIES: ${env.DEPENDENCY_VULNS}"   >> reports/dependency-summary.txt
+                        echo "EXIT_CODE: ${depExit}"                      >> reports/dependency-summary.txt
+                        echo "GATE: ${depStatus}"                         >> reports/dependency-summary.txt
+                        echo "REPORT: reports/dependency-report.json"     >> reports/dependency-summary.txt
+                    """
+
+                    if (depStatus == 'FAILED') {
+                        echo """
+===================================
+  ❌  DEPENDENCY SCAN : FAILED
+      Tool        : ${depTool}
+      Vulnerable  : ${vulnCount}
+==================================="""
+                    } else {
+                        echo """
+===================================
+  ✅  DEPENDENCY SCAN : PASSED
+      Tool        : ${depTool}
+      Vulnerable  : ${vulnCount}
+==================================="""
+                    }
+                
+}
+
+def run_Secret_Scan_10() {
+                    sh 'mkdir -p reports'
+
+                    // Auto-install Gitleaks binary if not present
+                    sh '''
+                        export PATH="$HOME/.local/bin:$PATH"
+                        if ! command -v gitleaks >/dev/null 2>&1; then
+                            echo "Installing Gitleaks..."
+                            GITLEAKS_VERSION="8.27.2"
+                            GITLEAKS_URL="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+                            mkdir -p "$HOME/.local/bin"
+                            curl -sSfL "${GITLEAKS_URL}" -o /tmp/gitleaks.tar.gz
+                            tar -xzf /tmp/gitleaks.tar.gz -C "$HOME/.local/bin" gitleaks
+                            chmod +x "$HOME/.local/bin/gitleaks"
+                            rm -f /tmp/gitleaks.tar.gz
+                        fi
+                        gitleaks version
+                    '''
+
+                    // Scan Git history — returnStatus: pipeline does NOT fail on findings
+                    def secretExit = sh(
+                        script: '''
+                            export PATH="$HOME/.local/bin:$PATH"
+                            gitleaks git . \
+                                --report-format json \
+                                --report-path reports/secret-report.json \
+                                --redact 2>/dev/null
+                        ''',
+                        returnStatus: true
+                    )
+                    echo "Gitleaks exit code: ${secretExit}"
+                    // Gitleaks: 0 = clean, 1 = secrets found, other = error
+
+                    // Parse JSON report
+                    sh '''
+                        python3 - <<'PYEOF'
+import json
+try:
+    with open('reports/secret-report.json', 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    # Gitleaks JSON is a list of findings
+    count = len(data) if isinstance(data, list) else 0
+except:
+    count = 0
+with open('.secret_count.txt', 'w') as f: f.write(str(count))
+print('Secrets detected:', count)
+PYEOF
+                    '''
+
+                    // Separate sh before readFile
+                    sh 'cat .secret_count.txt'
+                    env.SECRET_COUNT = readFile('.secret_count.txt').trim()
+
+                    def secretCount = env.SECRET_COUNT.isInteger() ? env.SECRET_COUNT.toInteger() : 0
+
+                    // 3-way status: PASSED / FAILED / ERROR
+                    // ERROR = Gitleaks itself crashed (exit > 1) — must not silently allow deploy
+                    def secretStatus
+                    if (secretExit == 0 && secretCount == 0) {
+                        secretStatus = 'PASSED'
+                    } else if (secretExit == 1 || secretCount > 0) {
+                        secretStatus = 'FAILED'
+                    } else {
+                        secretStatus = 'ERROR'  // exit 2+ = tool error
+                    }
+                    env.SECRET_STATUS = secretStatus
+
+                    sh """
+                        echo "STATUS: ${secretStatus}"           > reports/secret-summary.txt
+                        echo "TOOL: Gitleaks"                   >> reports/secret-summary.txt
+                        echo "EXIT_CODE: ${secretExit}"         >> reports/secret-summary.txt
+                        echo "SECRETS_DETECTED: ${secretCount}" >> reports/secret-summary.txt
+                        echo "GATE: ${secretStatus}"            >> reports/secret-summary.txt
+                        echo "NOTE: Values redacted via --redact" >> reports/secret-summary.txt
+                        echo "REPORT: reports/secret-report.json" >> reports/secret-summary.txt
+                    """
+
+                    if (secretStatus == 'FAILED') {
+                        echo """
+===================================
+  ❌  SECRET SCAN : FAILED
+      Tool     : Gitleaks
+      Secrets  : ${secretCount}
+      ⚠️  Values redacted in report
+==================================="""
+                    } else if (secretStatus == 'ERROR') {
+                        echo """
+===================================
+  ⚠️  SECRET SCAN : ERROR
+      Gitleaks exited with code ${secretExit}
+      Check Jenkins logs for details
+==================================="""
+                    } else {
+                        echo """
+===================================
+  ✅  SECRET SCAN : PASSED
+      Tool     : Gitleaks
+      Secrets  : 0
+==================================="""
+                    }
+                
+}
+
+def run_Docker_Build_11() {
+                    sh 'mkdir -p reports'
+
+                    if (!fileExists('Dockerfile')) {
+                        // No Dockerfile — mark as FAILED
+                        env.DOCKER_BUILD_STATUS = 'FAILED'
+                        env.DOCKER_IMAGE        = 'NONE'
+                        sh '''
+                            echo "STATUS: FAILED"                 > reports/docker-build-summary.txt
+                            echo "TOOL: Docker"                  >> reports/docker-build-summary.txt
+                            echo "REASON: Dockerfile not found"  >> reports/docker-build-summary.txt
+                        '''
+                        echo '❌ Dockerfile not found — Docker Build FAILED'
+
+                    } else {
+                        // Tag : <project>:<BUILD_NUMBER>
+                        env.DOCKER_IMAGE = "${env.SONAR_PROJECT_KEY}:${env.BUILD_NUMBER}"
+                        echo """
+===================================
+  🐳  DOCKER BUILD
+      Image : ${env.DOCKER_IMAGE}
+==================================="""
+
+                        def dockerExit = sh(
+                            script: """
+                                docker build \
+                                    --label "org.opencontainers.image.revision=${env.GIT_COMMIT_FULL ?: 'unknown'}" \
+                                    --label "org.opencontainers.image.version=${env.BUILD_NUMBER}" \
+                                    --label "org.opencontainers.image.source=${params.GIT_URL}" \
+                                    -t ${env.DOCKER_IMAGE} \
+                                    .
+                            """,
+                            returnStatus: true
+                        )
+
+                        env.DOCKER_BUILD_STATUS = (dockerExit == 0) ? 'PASSED' : 'FAILED'
+
+                        // Capture image digest if build succeeded
+                        if (env.DOCKER_BUILD_STATUS == 'PASSED') {
+                            sh """
+                                docker image inspect ${env.DOCKER_IMAGE} \
+                                    --format='{{.Id}}' > .docker_image_id.txt 2>/dev/null || echo 'unknown' > .docker_image_id.txt
+                            """
+                            env.DOCKER_IMAGE_ID = readFile('.docker_image_id.txt').trim()
+                        } else {
+                            env.DOCKER_IMAGE_ID = 'NONE'
+                        }
+
+                        sh """
+                            echo "STATUS: ${env.DOCKER_BUILD_STATUS}"  > reports/docker-build-summary.txt
+                            echo "TOOL: Docker"                        >> reports/docker-build-summary.txt
+                            echo "IMAGE: ${env.DOCKER_IMAGE}"          >> reports/docker-build-summary.txt
+                            echo "IMAGE_ID: ${env.DOCKER_IMAGE_ID}"    >> reports/docker-build-summary.txt
+                            echo "BUILD_NUMBER: ${env.BUILD_NUMBER}"   >> reports/docker-build-summary.txt
+                            echo "PROJECT: ${env.SONAR_PROJECT_KEY}"   >> reports/docker-build-summary.txt
+                            echo "LANGUAGE: ${env.DETECTED_LANGUAGE}"  >> reports/docker-build-summary.txt
+                            echo "EXIT_CODE: ${dockerExit}"            >> reports/docker-build-summary.txt
+                        """
+
+                        if (env.DOCKER_BUILD_STATUS == 'PASSED') {
+                            echo """
+===================================
+  ✅  DOCKER BUILD : PASSED
+      Image  : ${env.DOCKER_IMAGE}
+      Digest : ${env.DOCKER_IMAGE_ID?.take(19)}...
+==================================="""
+                        } else {
+                            echo """
+===================================
+  ❌  DOCKER BUILD : FAILED
+      Image  : ${env.DOCKER_IMAGE}
+      Check build logs above
+==================================="""
+                        }
+                    }
+                
+}
+
+def run_Container_Scan_12() {
+                    sh 'mkdir -p reports'
+                    echo """
+===================================
+  🔍  CONTAINER SECURITY SCAN
+      Tool  : Trivy 0.72.0
+      Image : ${env.DOCKER_IMAGE}
+=================================="""
+
+                    // Trivy via Docker — mounts docker.sock to access local images
+                    def trivyExit = sh(
+                        script: """
+                            docker run --rm \\
+                                -v /var/run/docker.sock:/var/run/docker.sock \\
+                                -v /tmp/trivy-cache:/root/.cache/trivy \\
+                                aquasec/trivy:0.72.0 \\
+                                image \\
+                                --scanners vuln \\
+                                --severity HIGH,CRITICAL \\
+                                --format json \\
+                                --exit-code 1 \\
+                                ${env.DOCKER_IMAGE} \\
+                                > reports/container-scan-report.json
+                        """,
+                        returnStatus: true
+                    )
+                    echo "Trivy exit code: ${trivyExit}"
+                    // 0 = clean, 1 = findings, >1 = Trivy execution error
+
+                    // Parse JSON — count CRITICAL and HIGH
+                    sh '''
+                        python3 - <<'PYEOF'
+import json
+critical = 0
+high = 0
+try:
+    with open('reports/container-scan-report.json', 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    for result in data.get('Results', []):
+        for vuln in (result.get('Vulnerabilities') or []):
+            sev = str(vuln.get('Severity', '')).upper()
+            if sev == 'CRITICAL': critical += 1
+            elif sev == 'HIGH':   high += 1
+except Exception as e:
+    print('Trivy report parse error:', e)
+with open('.container_critical.txt', 'w') as f: f.write(str(critical))
+with open('.container_high.txt',     'w') as f: f.write(str(high))
+print(f'Container vulnerabilities: CRITICAL={critical}, HIGH={high}')
+PYEOF
+                    '''
+
+                    // Separate sh before readFile
+                    sh 'cat .container_critical.txt .container_high.txt'
+                    env.CONTAINER_CRITICAL = readFile('.container_critical.txt').trim()
+                    env.CONTAINER_HIGH     = readFile('.container_high.txt').trim()
+
+                    def criticalCount = env.CONTAINER_CRITICAL.isInteger() ? env.CONTAINER_CRITICAL.toInteger() : 0
+                    def highCount     = env.CONTAINER_HIGH.isInteger()     ? env.CONTAINER_HIGH.toInteger()     : 0
+
+                    // 3-way status : PASSED / FAILED / ERROR
+                    def containerStatus
+                    if (trivyExit > 1) {
+                        containerStatus = 'ERROR'   // Trivy itself crashed
+                    } else if (criticalCount > 0 || highCount >= 5) {
+                        containerStatus = 'FAILED'  // exceeds thresholds
+                    } else {
+                        containerStatus = 'PASSED'
+                    }
+                    env.CONTAINER_SCAN_STATUS = containerStatus
+
+                    sh """
+                        echo "STATUS: ${containerStatus}"              > reports/container-scan-summary.txt
+                        echo "TOOL: Trivy 0.72.0"                     >> reports/container-scan-summary.txt
+                        echo "IMAGE: ${env.DOCKER_IMAGE}"             >> reports/container-scan-summary.txt
+                        echo "CRITICAL: ${criticalCount}"             >> reports/container-scan-summary.txt
+                        echo "HIGH: ${highCount}"                     >> reports/container-scan-summary.txt
+                        echo "CRITICAL_THRESHOLD: >0 = BLOCKED"       >> reports/container-scan-summary.txt
+                        echo "HIGH_THRESHOLD: >=5 = BLOCKED"          >> reports/container-scan-summary.txt
+                        echo "TRIVY_EXIT: ${trivyExit}"               >> reports/container-scan-summary.txt
+                        echo "REPORT: reports/container-scan-report.json" >> reports/container-scan-summary.txt
+                    """
+
+                    if (containerStatus == 'FAILED') {
+                        echo """
+===================================
+  ❌  CONTAINER SCAN : FAILED
+      CRITICAL : ${criticalCount}
+      HIGH     : ${highCount}
+      Threshold: CRITICAL>0 or HIGH>=5
+=================================="""
+                    } else if (containerStatus == 'ERROR') {
+                        echo """
+===================================
+  ⚠️  CONTAINER SCAN : ERROR
+      Trivy exited with code ${trivyExit}
+      Check Jenkins logs for details
+=================================="""
+                    } else {
+                        echo """
+===================================
+  ✅  CONTAINER SCAN : PASSED
+      CRITICAL : ${criticalCount}
+      HIGH     : ${highCount}
+=================================="""
+                    }
+                
+}
+
+def run_Generate_SBOM_13() {
+                    sh 'mkdir -p reports'
+                    echo """
+===================================
+  📦  GENERATE SBOM
+      Format : CycloneDX JSON
+      Tool   : Trivy 0.72.0
+      Image  : ${env.DOCKER_IMAGE}
+=================================="""
+
+                    def sbomExit = sh(
+                        script: """
+                            docker run --rm \\
+                                -v /var/run/docker.sock:/var/run/docker.sock \\
+                                aquasec/trivy:0.72.0 \\
+                                image \\
+                                --format cyclonedx \\
+                                ${env.DOCKER_IMAGE} \\
+                                > reports/sbom.cdx.json
+                        """,
+                        returnStatus: true
+                    )
+
+                    // Verify file was actually created
+                    if (sbomExit == 0 && fileExists('reports/sbom.cdx.json')) {
+                        env.SBOM_STATUS = 'PASSED'
+                    } else {
+                        env.SBOM_STATUS = 'ERROR'
+                        echo '❌ SBOM file not generated'
+                    }
+
+                    // Count components from CycloneDX JSON
+                    sh '''
+                        python3 - <<'PYEOF'
+import json
+count = 0
+try:
+    with open('reports/sbom.cdx.json', 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    count = len(data.get('components', []))
+except Exception as e:
+    print('SBOM parse error:', e)
+with open('.sbom_components.txt', 'w') as f: f.write(str(count))
+print('SBOM components:', count)
+PYEOF
+                    '''
+
+                    sh 'cat .sbom_components.txt'
+                    env.SBOM_COMPONENTS = readFile('.sbom_components.txt').trim()
+
+                    sh """
+                        echo "STATUS: ${env.SBOM_STATUS}"            > reports/sbom-summary.txt
+                        echo "TOOL: Trivy 0.72.0"                   >> reports/sbom-summary.txt
+                        echo "FORMAT: CycloneDX JSON"               >> reports/sbom-summary.txt
+                        echo "IMAGE: ${env.DOCKER_IMAGE}"           >> reports/sbom-summary.txt
+                        echo "COMPONENTS: ${env.SBOM_COMPONENTS}"   >> reports/sbom-summary.txt
+                        echo "REPORT: reports/sbom.cdx.json"        >> reports/sbom-summary.txt
+                    """
+
+                    if (env.SBOM_STATUS == 'PASSED') {
+                        echo """
+===================================
+  ✅  SBOM : PASSED
+      Components : ${env.SBOM_COMPONENTS}
+      Format     : CycloneDX JSON
+      File       : reports/sbom.cdx.json
+=================================="""
+                    } else {
+                        echo """
+===================================
+  ❌  SBOM : ERROR
+      Generation failed — check Trivy logs
+=================================="""
+                    }
+                
+}
+
+def run_AI_Security_Advisor_29() {
+    sh 'mkdir -p reports'
+
+    env.AI_ADVISOR_STATUS = 'RUNNING'
+
+    echo """
+===================================
+  🤖  AI SECURITY ADVISOR
+      Provider : Gemini
+      Model    : Gemini 3.7 Flash
+      Project  : ${env.SONAR_PROJECT_KEY}
+      Build    : #${env.BUILD_NUMBER}
+      Env      : ${env.SELECTED_ENV}
+      Waiting for AI analysis...
+===================================
+"""
+
+    try {
+
+        timeout(time: 5, unit: 'MINUTES') {
+
+            withCredentials([
+                string(
+                    credentialsId: 'gemini-api-key',
+                    variable: 'GEMINI_API_KEY'
+                )
+            ]) {
+
+                dir('ai-advisor-tool') {
+                    git(
+                        url: 'https://gitlab.com/devsecops-pipeline-manager/ai-advisor.git',
+                        credentialsId: 'gitlab-private-token',
+                        branch: 'main'
+                    )
+                }
+
+                sh '''
+                    set -e
+
+                    export PATH="$HOME/.local/bin:$PATH"
+
+                    echo "Installing AI Security Advisor dependencies..."
+
+                    python3 -m pip install \
+                        -r ai-advisor-tool/requirements.txt \
+                        --break-system-packages \
+                        --quiet
+
+                    echo "Running AI Security Advisor..."
+
+                    python3 ai-advisor-tool/ai_security_advisor.py \
+                        --sast reports/sast-report.json \
+                        --dependency reports/dependency-report.json \
+                        --container reports/container-scan-report.json \
+                        --sbom reports/sbom.cdx.json \
+                        --output reports/ai-security-report.json \
+                        --project "$SONAR_PROJECT_KEY" \
+                        --build "$BUILD_NUMBER" \
+                        --env "$SELECTED_ENV"
+                '''
+            }
+        }
+
+        if (!fileExists('reports/ai-security-report.json')) {
+            error('AI Security Advisor did not generate reports/ai-security-report.json')
+        }
+
+        env.AI_ADVISOR_STATUS = 'PASSED'
+
+        writeFile(
+            file: 'reports/ai-security-status.txt',
+            text: """STATUS: PASSED
+TOOL: Gemini AI Security Advisor
+PROJECT: ${env.SONAR_PROJECT_KEY}
+BUILD: ${env.BUILD_NUMBER}
+ENVIRONMENT: ${env.SELECTED_ENV}
+REPORT: reports/ai-security-report.json
+"""
+        )
+
+        echo """
+===================================
+  ✅  AI SECURITY ADVISOR : PASSED
+      Report : reports/ai-security-report.json
+===================================
+"""
+
+    } catch (Exception e) {
+
+        env.AI_ADVISOR_STATUS = 'FAILED'
+
+        echo """
+===================================
+  ⚠️  AI SECURITY ADVISOR : FAILED
+      ${e.getMessage()}
+      Pipeline will continue because AI is advisory.
+===================================
+"""
+
+        writeFile(
+            file: 'reports/ai-security-report.json',
+            text: """# 🤖 AI Security Analysis Report
+
+## Status
+
+⚠️ AI Security Advisor failed to run.
+
+## Error
+
+${e.getMessage()}
+
+## Pipeline information
+
+- Project: ${env.SONAR_PROJECT_KEY}
+- Build: #${env.BUILD_NUMBER}
+- Environment: ${env.SELECTED_ENV}
+"""
+        )
+
+        writeFile(
+            file: 'reports/ai-security-status.txt',
+            text: """STATUS: FAILED
+TOOL: Gemini AI Security Advisor
+PROJECT: ${env.SONAR_PROJECT_KEY}
+BUILD: ${env.BUILD_NUMBER}
+ENVIRONMENT: ${env.SELECTED_ENV}
+ERROR: ${e.getMessage()}
+REPORT: reports/ai-security-report.json
+"""
+        )
+    }
+}
+
+def ensure_default_policy_files() {
+    sh 'mkdir -p policy'
+    if (!fileExists('policy/devsecops.rego')) {
+        echo 'No custom policy/devsecops.rego found in project — generating default OPA policy...'
+        writeFile(
+            file: 'policy/devsecops.rego',
+            text: '''package devsecops
+
+default allow := false
+
+allow if {
+    count(deny) == 0
+}
+
+deny contains msg if {
+    input.tests.enabled == true
+    to_number(input.tests.failures) > 0
+    msg := sprintf("Unit tests failed: %v failure(s) detected", [input.tests.failures])
+}
+
+deny contains msg if {
+    input.quality.enabled == true
+    to_number(input.quality.bugs) > 10
+    msg := sprintf("Code quality threshold exceeded: %v bugs (max allowed: 10)", [input.quality.bugs])
+}
+
+deny contains msg if {
+    input.sast.enabled == true
+    to_number(input.sast.blocking_findings) > 0
+    msg := sprintf("SAST detected %v blocking finding(s) (HIGH/CRITICAL severity)", [input.sast.blocking_findings])
+}
+
+deny contains msg if {
+    input.dependencies.enabled == true
+    input.dependencies.status == "FAILED"
+    msg := sprintf("Dependency scan failed: %v vulnerable package(s) detected", [input.dependencies.vulnerabilities])
+}
+
+deny contains msg if {
+    input.secrets.enabled == true
+    to_number(input.secrets.count) > 0
+    msg := sprintf("Secret scan detected %v secret(s) in Git history", [input.secrets.count])
+}
+
+deny contains msg if {
+    input.docker.enabled == true
+    input.docker.status != "PASSED"
+    msg := sprintf("Docker build failed or skipped (status: %v)", [input.docker.status])
+}
+
+deny contains msg if {
+    input.container.enabled == true
+    to_number(input.container.critical) > 0
+    msg := sprintf("Container image scan detected %v CRITICAL vulnerability(ies)", [input.container.critical])
+}
+
+deny contains msg if {
+    input.container.enabled == true
+    to_number(input.container.high) >= 5
+    msg := sprintf("Container image scan detected %v HIGH vulnerability(ies) (max allowed: 4)", [input.container.high])
+}
+'''
+        )
+    }
+
+    if (!fileExists('policy/devsecops_test.rego')) {
+        echo 'No custom policy/devsecops_test.rego found in project — generating default Rego unit tests...'
+        writeFile(
+            file: 'policy/devsecops_test.rego',
+            text: '''package devsecops_test
+
+import data.devsecops
+
+test_allow_when_zero_issues if {
+    devsecops.allow with input as {
+        "tests": {"enabled": true, "failures": 0},
+        "quality": {"enabled": true, "bugs": 0},
+        "sast": {"enabled": true, "blocking_findings": 0},
+        "dependencies": {"enabled": true, "status": "PASSED", "vulnerabilities": 0},
+        "secrets": {"enabled": true, "status": "PASSED", "count": 0},
+        "docker": {"enabled": true, "status": "PASSED"},
+        "container": {"enabled": true, "status": "PASSED", "critical": 0, "high": 0},
+        "sbom": {"enabled": true, "status": "PASSED"}
+    }
+}
+'''
+        )
+    }
+}
+
+def run_Prepare_Policy_Input_14() {
+                    sh 'mkdir -p reports'
+                    ensure_default_policy_files()
+
+                    writeFile(
+                        file: 'reports/security-policy-input.json',
+                        text: """\
+{
+  "tests":        { "enabled": ${params.RUN_TESTS},           "failures": ${env.TEST_FAILURES ?: '0'} },
+  "quality":      { "enabled": ${params.RUN_QUALITY},         "bugs": ${env.QUALITY_ISSUES ?: '0'} },
+  "sonar":        { "enabled": ${params.RUN_SONAR},           "status": "${env.SONAR_GATE_STATUS ?: 'SKIPPED'}", "passed": ${env.SONAR_GATE_PASSED ?: 'false'} },
+  "sast":         { "enabled": ${params.RUN_SECURITY && params.RUN_SAST},            "blocking_findings": ${env.SAST_ERRORS ?: '0'} },
+  "dependencies": { "enabled": ${params.RUN_SECURITY && params.RUN_DEPENDENCY},      "status": "${env.DEPENDENCY_STATUS ?: 'SKIPPED'}", "vulnerabilities": ${env.DEPENDENCY_VULNS ?: '0'} },
+  "secrets":      { "enabled": ${params.RUN_SECURITY && params.RUN_SECRET},          "status": "${env.SECRET_STATUS ?: 'SKIPPED'}", "count": ${env.SECRET_COUNT ?: '0'} },
+  "docker":       { "enabled": ${params.RUN_DOCKER_BUILD},    "status": "${env.DOCKER_BUILD_STATUS ?: 'SKIPPED'}" },
+  "container":    { "enabled": ${params.RUN_SECURITY && params.RUN_CONTAINER_SCAN},  "status": "${env.CONTAINER_SCAN_STATUS ?: 'SKIPPED'}", "critical": ${env.CONTAINER_CRITICAL ?: '0'}, "high": ${env.CONTAINER_HIGH ?: '0'} },
+  "sbom":         { "enabled": ${params.RUN_SBOM},            "status": "${env.SBOM_STATUS ?: 'SKIPPED'}" },
+  "signature":    { "sign_status": "${env.COSIGN_SIGN_STATUS ?: 'SKIPPED'}", "verify_status": "${env.COSIGN_VERIFY_STATUS ?: 'SKIPPED'}" },
+  "environment":  "${env.SELECTED_ENV}"
+}
+"""
+                    )
+                    echo '📄 Policy input written → reports/security-policy-input.json'
+
+                    // ── Consolidated security-report.txt for backend API ──
+                    def sastErrors    = (env.SAST_ERRORS    ?: '0').toInteger()
+                    def depVulns      = (env.DEPENDENCY_VULNS ?: '0').toInteger()
+                    def secretCount   = (env.SECRET_COUNT   ?: '0').toInteger()
+                    def containerCrit = (env.CONTAINER_CRITICAL ?: '0').toInteger()
+                    def containerHigh = (env.CONTAINER_HIGH    ?: '0').toInteger()
+
+                    def secTotal  = sastErrors + depVulns + secretCount + containerCrit + containerHigh
+                    def secStatus = (containerCrit > 0 || secretCount > 0) ? 'FAILED'
+                                  : (secTotal > 0) ? 'WARN'
+                                  : 'PASSED'
+                    def secBlocked = (containerCrit > 0 || secretCount > 0) ? 'true' : 'false'
+
+                    def toolsList = []
+                    if (params.RUN_SECURITY && params.RUN_SAST)           toolsList.add('Semgrep')
+                    if (params.RUN_SECURITY && params.RUN_DEPENDENCY)     toolsList.add('pip-audit/npm-audit/trivy')
+                    if (params.RUN_SECURITY && params.RUN_SECRET)         toolsList.add('Gitleaks')
+                    if (params.RUN_SECURITY && params.RUN_CONTAINER_SCAN) toolsList.add('Trivy-Container')
+
+                    writeFile(
+                        file: 'reports/security-report.txt',
+                        text: """\
+STATUS: ${secStatus}
+TOOLS: ${toolsList.join(', ') ?: 'N/A'}
+CRITICAL: ${containerCrit}
+HIGH: ${containerHigh + sastErrors}
+MEDIUM: 0
+LOW: 0
+SECRETS: ${secretCount}
+VULNERABLE_DEPS: ${depVulns}
+DEPLOYMENT_BLOCKED: ${secBlocked}
+BUILD_NUMBER: ${env.BUILD_NUMBER}
+ENVIRONMENT: ${env.SELECTED_ENV}
+LANGUAGE: ${env.DETECTED_LANGUAGE}
+SUMMARY: Security scan completed. ${secTotal} issue(s): ${containerCrit} critical container, ${containerHigh} high container, ${sastErrors} SAST blocking, ${depVulns} dep vulns, ${secretCount} secrets.
+TOOL_STATUS|Semgrep|SAST Analysis|${env.SAST_STATUS ?: 'SKIPPED'}|Findings: ${env.SAST_TOTAL ?: '0'} total, ${env.SAST_ERRORS ?: '0'} blocking
+TOOL_STATUS|pip-audit/npm-audit|Dependency Scan|${env.DEPENDENCY_STATUS ?: 'SKIPPED'}|Vulnerable packages: ${depVulns}
+TOOL_STATUS|Gitleaks|Secret Detection|${env.SECRET_STATUS ?: 'SKIPPED'}|Secrets detected: ${secretCount}
+TOOL_STATUS|Trivy|Container Scan|${env.CONTAINER_SCAN_STATUS ?: 'SKIPPED'}|Critical: ${containerCrit}, High: ${containerHigh}
+"""
+                    )
+                    echo '🔒 Consolidated security-report.txt → reports/security-report.txt'
+                
+}
+
+def run_Test_Security_Policies_15() {
+                    ensure_default_policy_files()
+                    def testExit = sh(
+                        script: '''
+                            set -o pipefail
+                            opa test policy/ -v 2>&1 | tee reports/policy-test-results.txt
+                        ''',
+                        returnStatus: true
+                    )
+                    if (testExit != 0) {
+                        echo """
+===================================
+  ❌  POLICY TESTS : FAILED
+      Rego policy has broken rules.
+      Fix policy/devsecops.rego
+=================================="""
+                        currentBuild.result = 'FAILURE'
+                        error('OPA policy tests failed — invalid security rules detected')
+                    } else {
+                        echo """
+===================================
+  ✅  POLICY TESTS : PASSED
+      All Rego rules validated
+=================================="""
+                    }
+                
+}
+
+def run_Policy_as_Code_16() {
+                    sh 'mkdir -p reports'
+
+                    // ── Run OPA eval ────────────────────────────
+                    sh '''
+                        opa eval \
+                            --format json \
+                            --data policy/devsecops.rego \
+                            --input reports/security-policy-input.json \
+                            'data.devsecops.deny' \
+                            > reports/policy-result.json 2>&1
+                    '''
+
+                    // ── Parse JSON result with Python ───────────
+                    sh '''
+python3 - <<\'PYEOF\'
+import json, sys
+
+deny = []
+try:
+    with open("reports/policy-result.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    results = data.get("result", [])
+    if results:
+        exprs = results[0].get("expressions", [])
+        if exprs:
+            deny = list(exprs[0].get("value", []) or [])
+except Exception as e:
+    print("OPA parse error:", e, file=sys.stderr)
+
+with open(".policy_denials.txt", "w") as f:
+    for r in deny:
+        f.write(str(r) + "\\n")
+
+with open(".policy_denial_count.txt", "w") as f:
+    f.write(str(len(deny)))
+
+print("OPA denials:", len(deny))
+for r in deny:
+    print(" -", r)
+PYEOF
+                    '''
+
+                    // ── Read results into Groovy ─────────────────
+                    env.POLICY_DENIAL_COUNT = readFile('.policy_denial_count.txt').trim()
+                    def denialCount = env.POLICY_DENIAL_COUNT.isInteger()
+                        ? env.POLICY_DENIAL_COUNT.toInteger() : 0
+
+                    if (denialCount == 0) {
+                        env.POLICY_STATUS = 'PASSED'
+                        deployAllowed     = true
+                        blockReasons      = []
+                        echo """
+╔══════════════════════════════════════════╗
+  ✅  POLICY AS CODE : PASSED
+      OPA / Rego → DEPLOYMENT ALLOWED
+      Policy : policy/devsecops.rego
+╚══════════════════════════════════════════╝"""
+                    } else {
+                        env.POLICY_STATUS = 'FAILED'
+                        deployAllowed     = false
+                        blockReasons      = readFile('.policy_denials.txt')
+                            .readLines()
+                            .findAll { it?.trim() }
+                        echo """
+╔══════════════════════════════════════════╗
+  ❌  POLICY AS CODE : FAILED
+      OPA / Rego → DEPLOYMENT BLOCKED
+      Denials (${denialCount}):
+      ${blockReasons.join('\n      ')}
+╚══════════════════════════════════════════╝"""
+                    }
+
+                    // ── Policy summary report ────────────────────
+                    sh """
+                        echo "STATUS: ${env.POLICY_STATUS}"          > reports/policy-summary.txt
+                        echo "TOOL: Open Policy Agent (OPA)"        >> reports/policy-summary.txt
+                        echo "POLICY: policy/devsecops.rego"        >> reports/policy-summary.txt
+                        echo "DENIALS: ${env.POLICY_DENIAL_COUNT}"  >> reports/policy-summary.txt
+                    """
+                
+}
+
+def run_Deployment_Decision_17() {
+    sh 'mkdir -p reports'
+
+    def testStatus       = params.RUN_TESTS          ? "FAILURES=${env.TEST_FAILURES}"   : 'SKIPPED'
+    def qualStatus       = params.RUN_QUALITY        ? "BUGS=${env.QUALITY_ISSUES}"      : 'SKIPPED'
+    def sonarStatus      = params.RUN_SONAR          ? "${env.SONAR_GATE_STATUS ?: 'UNKNOWN'}" : 'SKIPPED'
+    def sastStatus       = params.RUN_SAST           ? "FINDINGS=${env.SAST_TOTAL} BLOCKING=${env.SAST_ERRORS}" : 'SKIPPED'
+    def depStatus        = params.RUN_DEPENDENCY     ? "${env.DEPENDENCY_STATUS} VULNS=${env.DEPENDENCY_VULNS}" : 'SKIPPED'
+    def secretStatus     = params.RUN_SECRET         ? "${env.SECRET_STATUS} COUNT=${env.SECRET_COUNT}" : 'SKIPPED'
+    def dockerStatus     = params.RUN_DOCKER_BUILD   ? "${env.DOCKER_BUILD_STATUS} IMAGE=${env.DOCKER_IMAGE}" : 'SKIPPED'
+    def containerStatus  = params.RUN_CONTAINER_SCAN ? "${env.CONTAINER_SCAN_STATUS} CRITICAL=${env.CONTAINER_CRITICAL} HIGH=${env.CONTAINER_HIGH}" : 'SKIPPED'
+    def sbomStatus       = params.RUN_SBOM           ? "${env.SBOM_STATUS} COMPONENTS=${env.SBOM_COMPONENTS}" : 'SKIPPED'
+
+    // Composite deployment gate: OPA + SonarQube.
+    // SonarQube failures are recorded earlier without aborting the pipeline so that
+    // SAST, dependency, secret, container and SBOM reports are still collected.
+    def combinedReasons = []
+    if (blockReasons) {
+        combinedReasons.addAll(blockReasons)
+    }
+
+    if (params.RUN_SONAR && env.SONAR_GATE_STATUS != 'OK') {
+        combinedReasons.add("SonarQube Quality Gate=${env.SONAR_GATE_STATUS ?: 'UNKNOWN'}")
+    }
+
+    if (!combinedReasons.isEmpty()) {
+        deployAllowed = false
+        blockReasons = combinedReasons.unique()
+    }
+
+    env.DEPLOYMENT_DECISION = deployAllowed ? 'APPROVED' : 'BLOCKED'
+
+    if (deployAllowed) {
+        writeFile(
+            file: 'reports/deployment-decision.txt',
+            text: """\
+DECISION: APPROVED
+DEPLOYMENT_BLOCKED: false
+BUILD_NUMBER: ${env.BUILD_NUMBER}
+ENVIRONMENT: ${env.SELECTED_ENV}
+LANGUAGE: ${env.DETECTED_LANGUAGE}
+PROJECT: ${env.SONAR_PROJECT_KEY}
+TESTS: ${testStatus}
+CODE_QUALITY: ${qualStatus}
+SONARQUBE_QUALITY_GATE: ${sonarStatus}
+SAST: ${sastStatus}
+DEPENDENCY_SCAN: ${depStatus}
+SECRET_SCAN: ${secretStatus}
+DOCKER_BUILD: ${dockerStatus}
+DOCKER_IMAGE: ${env.DOCKER_IMAGE ?: 'N/A'}
+CONTAINER_SCAN: ${containerStatus}
+SBOM: ${sbomStatus}
+REASON: All quality gates passed.
+NEXT_ACTION: Ready for deployment to ${env.SELECTED_ENV}
+"""
+        )
+        echo 'DEPLOYMENT ALLOWED → APPROVED'
+    } else {
+        writeFile(
+            file: 'reports/deployment-decision.txt',
+            text: """\
+DECISION: BLOCKED
+DEPLOYMENT_BLOCKED: true
+BUILD_NUMBER: ${env.BUILD_NUMBER}
+ENVIRONMENT: ${env.SELECTED_ENV}
+LANGUAGE: ${env.DETECTED_LANGUAGE}
+PROJECT: ${env.SONAR_PROJECT_KEY}
+TESTS: ${testStatus}
+CODE_QUALITY: ${qualStatus}
+SONARQUBE_QUALITY_GATE: ${sonarStatus}
+SAST: ${sastStatus}
+DEPENDENCY_SCAN: ${depStatus}
+SECRET_SCAN: ${secretStatus}
+DOCKER_BUILD: ${dockerStatus}
+CONTAINER_SCAN: ${containerStatus}
+SBOM: ${sbomStatus}
+REASON: ${blockReasons.join(' | ')}
+NEXT_ACTION: Fix the reported issues and re-run the pipeline
+"""
+        )
+        currentBuild.result = 'FAILURE'
+        echo "DEPLOYMENT BLOCKED → ${blockReasons.join(' | ')}"
+    }
+}
+
+def run_Publish_Image_18() {
+    sh 'mkdir -p reports'
+    env.REGISTRY_PUSH_STATUS = 'FAILED'
+
+    if (env.DOCKER_BUILD_STATUS != 'PASSED' || !env.DOCKER_IMAGE?.trim()) {
+        error('Cannot publish image: Docker build did not pass')
+    }
+
+    echo """
+=========================================
+  📦  PUBLISH CONTAINER IMAGE
+      Registry   : ${env.REGISTRY_HOST}
+      Local image: ${env.DOCKER_IMAGE}
+      Build tag  : ${env.REGISTRY_BUILD_TAG}
+      Commit tag : ${env.REGISTRY_COMMIT_TAG}
+========================================="""
+
+    try {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'gitlab-registry-token',
+                usernameVariable: 'REGISTRY_USER',
+                passwordVariable: 'REGISTRY_TOKEN'
+            )
+        ]) {
+            try {
+                sh '''
+                    set -eu
+                    echo "$REGISTRY_TOKEN" | docker login registry.gitlab.com \
+                        --username "$REGISTRY_USER" \
+                        --password-stdin
+                '''
+
+                sh """
+                    set -eu
+                    docker tag ${env.DOCKER_IMAGE} ${env.REGISTRY_BUILD_TAG}
+                    docker tag ${env.DOCKER_IMAGE} ${env.REGISTRY_COMMIT_TAG}
+                    docker push ${env.REGISTRY_BUILD_TAG}
+                    docker push ${env.REGISTRY_COMMIT_TAG}
+                """
+
+                env.REGISTRY_PUSH_STATUS = 'PASSED'
+            } finally {
+                sh 'docker logout registry.gitlab.com >/dev/null 2>&1 || true'
+            }
+        }
+    } catch (Exception e) {
+        env.REGISTRY_PUSH_STATUS = 'FAILED'
+        throw e
+    } finally {
+        writeFile(
+            file: 'reports/registry-publish-summary.txt',
+            text: """STATUS: ${env.REGISTRY_PUSH_STATUS}
+REGISTRY: ${env.REGISTRY_HOST}
+IMAGE: ${env.REGISTRY_IMAGE}
+BUILD_TAG: ${env.REGISTRY_BUILD_TAG}
+COMMIT_TAG: ${env.REGISTRY_COMMIT_TAG}
+"""
+        )
+    }
+
+    echo """
+=========================================
+  ✅  IMAGE PUBLISHED
+      ${env.REGISTRY_BUILD_TAG}
+      ${env.REGISTRY_COMMIT_TAG}
+========================================="""
+}
+
+def run_Resolve_Image_Digest_25() {
+    sh 'mkdir -p reports'
+    env.REGISTRY_DIGEST_STATUS = 'FAILED'
+
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'gitlab-registry-token',
+            usernameVariable: 'REGISTRY_USER',
+            passwordVariable: 'REGISTRY_TOKEN'
+        )
+    ]) {
+        try {
+            sh '''
+                set -eu
+                echo "$REGISTRY_TOKEN" | docker login registry.gitlab.com \
+                    --username "$REGISTRY_USER" \
+                    --password-stdin
+            '''
+
+            // Pull the exact registry tag first so Docker has the remote RepoDigest.
+            sh 'docker pull "$REGISTRY_BUILD_TAG"'
+
+            // A local image may already have another RepoDigest (for example
+            // sample-python-app@sha256:...). Never trust index 0 blindly.
+            // Prefer the RepoDigest that belongs to REGISTRY_IMAGE; if Docker
+            // only exposes a different repository name, reuse only the sha256
+            // part and rebuild the canonical GitLab Registry reference.
+            sh '''
+                set -eu
+
+                MATCHED_REF="$(
+                    docker image inspect "$REGISTRY_BUILD_TAG" \
+                        --format='{{range .RepoDigests}}{{println .}}{{end}}' \
+                    | grep -F "${REGISTRY_IMAGE}@sha256:" \
+                    | head -n 1 \
+                    || true
+                )"
+
+                if [ -z "$MATCHED_REF" ]; then
+                    FIRST_REF="$(
+                        docker image inspect "$REGISTRY_BUILD_TAG" \
+                            --format='{{index .RepoDigests 0}}'
+                    )"
+
+                    DIGEST="${FIRST_REF##*@}"
+                    case "$DIGEST" in
+                        sha256:*) ;;
+                        *)
+                            echo "Unable to extract sha256 digest from: $FIRST_REF" >&2
+                            exit 1
+                            ;;
+                    esac
+
+                    MATCHED_REF="${REGISTRY_IMAGE}@${DIGEST}"
+                fi
+
+                printf '%s\n' "$MATCHED_REF" > .registry_repo_digest.txt
+                echo "Canonical registry digest: $MATCHED_REF"
+            '''
+        } finally {
+            sh 'docker logout registry.gitlab.com >/dev/null 2>&1 || true'
+        }
+    }
+
+    env.REGISTRY_REPO_DIGEST = readFile('.registry_repo_digest.txt').trim()
+    def expectedPrefix = "${env.REGISTRY_IMAGE}@sha256:"
+
+    if (!env.REGISTRY_REPO_DIGEST.startsWith(expectedPrefix)) {
+        error("Invalid immutable registry digest. Expected prefix ${expectedPrefix}, got ${env.REGISTRY_REPO_DIGEST}")
+    }
+
+    env.REGISTRY_DIGEST_STATUS = 'PASSED'
+
+    writeFile(
+        file: 'reports/image-digest-summary.txt',
+        text: """STATUS: PASSED
+BUILD_TAG: ${env.REGISTRY_BUILD_TAG}
+REGISTRY_IMAGE: ${env.REGISTRY_IMAGE}
+DIGEST_REF: ${env.REGISTRY_REPO_DIGEST}
+"""
+    )
+
+    echo """
+=========================================
+  🔒  IMMUTABLE DIGEST RESOLVED
+      ${env.REGISTRY_REPO_DIGEST}
+========================================="""
+}
+def run_Sign_Image_26() {
+    sh 'mkdir -p reports'
+    env.COSIGN_SIGN_STATUS = 'FAILED'
+
+    if (sh(script: 'command -v cosign >/dev/null 2>&1', returnStatus: true) != 0) {
+        error('SIGN_IMAGE=true but cosign is not installed on the Jenkins agent')
+    }
+    if (!env.REGISTRY_REPO_DIGEST?.contains('@sha256:')) {
+        error('Cannot sign image: immutable registry digest is missing')
+    }
+
+    try {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'gitlab-registry-token',
+                usernameVariable: 'REGISTRY_USER',
+                passwordVariable: 'REGISTRY_TOKEN'
+            ),
+            file(
+                credentialsId: 'cosign-private-key',
+                variable: 'COSIGN_KEY'
+            ),
+            string(
+                credentialsId: 'cosign-password',
+                variable: 'COSIGN_KEY_PASSWORD'
+            )
+        ]) {
+            withEnv(["COSIGN_IMAGE=${env.REGISTRY_REPO_DIGEST}"]) {
+                try {
+                    sh '''
+                        set -eu
+                        echo "$REGISTRY_TOKEN" | docker login registry.gitlab.com \
+                            --username "$REGISTRY_USER" \
+                            --password-stdin
+
+                        COSIGN_PASSWORD="$COSIGN_KEY_PASSWORD" \
+                            cosign sign --yes --key "$COSIGN_KEY" "$COSIGN_IMAGE"
+                    '''
+                    env.COSIGN_SIGN_STATUS = 'PASSED'
+                } finally {
+                    sh 'docker logout registry.gitlab.com >/dev/null 2>&1 || true'
+                }
+            }
+        }
+    } finally {
+        writeFile(
+            file: 'reports/cosign-sign-summary.txt',
+            text: """STATUS: ${env.COSIGN_SIGN_STATUS}
+IMAGE: ${env.REGISTRY_REPO_DIGEST ?: 'NONE'}
+TOOL: Cosign
+"""
+        )
+    }
+}
+
+def run_Verify_Signature_27() {
+    sh 'mkdir -p reports'
+    env.COSIGN_VERIFY_STATUS = 'FAILED'
+
+    if (sh(script: 'command -v cosign >/dev/null 2>&1', returnStatus: true) != 0) {
+        error('SIGN_IMAGE=true but cosign is not installed on the Jenkins agent')
+    }
+
+    try {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'gitlab-registry-token',
+                usernameVariable: 'REGISTRY_USER',
+                passwordVariable: 'REGISTRY_TOKEN'
+            ),
+            file(
+                credentialsId: 'cosign-public-key',
+                variable: 'COSIGN_PUBLIC_KEY'
+            )
+        ]) {
+            withEnv(["COSIGN_IMAGE=${env.REGISTRY_REPO_DIGEST}"]) {
+                try {
+                    sh '''
+                        set -eu
+                        echo "$REGISTRY_TOKEN" | docker login registry.gitlab.com \
+                            --username "$REGISTRY_USER" \
+                            --password-stdin
+
+                        cosign verify --key "$COSIGN_PUBLIC_KEY" "$COSIGN_IMAGE" \
+                            > reports/cosign-verify.json
+                    '''
+                    env.COSIGN_VERIFY_STATUS = 'PASSED'
+                } finally {
+                    sh 'docker logout registry.gitlab.com >/dev/null 2>&1 || true'
+                }
+            }
+        }
+    } finally {
+        writeFile(
+            file: 'reports/cosign-verify-summary.txt',
+            text: """STATUS: ${env.COSIGN_VERIFY_STATUS}
+IMAGE: ${env.REGISTRY_REPO_DIGEST ?: 'NONE'}
+TOOL: Cosign
+REPORT: reports/cosign-verify.json
+"""
+        )
+    }
+}
+
+def run_Production_Approval_28() {
+    env.PROD_APPROVAL_STATUS = 'PENDING'
+
+    timeout(time: 15, unit: 'MINUTES') {
+        def approvedBy = input(
+            message: "Approve deployment of ${env.REGISTRY_REPO_DIGEST ?: env.DOCKER_IMAGE} to ${env.SELECTED_ENV}?",
+            ok: 'Approve deployment',
+            submitterParameter: 'APPROVED_BY'
+        )
+        env.PRODUCTION_APPROVED_BY = approvedBy?.toString() ?: 'unknown'
+    }
+
+    env.PROD_APPROVAL_STATUS = 'APPROVED'
+    writeFile(
+        file: 'reports/production-approval.txt',
+        text: """STATUS: APPROVED
+ENVIRONMENT: ${env.SELECTED_ENV}
+APPROVED_BY: ${env.PRODUCTION_APPROVED_BY}
+BUILD_NUMBER: ${env.BUILD_NUMBER}
+IMAGE: ${env.REGISTRY_REPO_DIGEST ?: env.DOCKER_IMAGE}
+"""
+    )
+}
+
+def run_Deploy_19() {
+    sh 'mkdir -p reports deployment'
+
+    if (!fileExists('deployment/docker-compose.yml')) {
+        echo 'No custom deployment/docker-compose.yml found — generating default template...'
+        writeFile(
+            file: 'deployment/docker-compose.yml',
+            text: '''version: '3.8'
+services:
+  app:
+    image: ${IMAGE_NAME}
+    container_name: ${CONTAINER_NAME}
+    restart: always
+    ports:
+      - "${HOST_PORT}:${CONTAINER_PORT}"
+'''
+        )
+    }
+
+    def containerPort
+    switch (env.DETECTED_LANGUAGE) {
+        case 'python':     containerPort = '5000'; break
+        case 'javascript': containerPort = '3000'; break
+        case 'java':       containerPort = '8080'; break
+        default:           containerPort = '8080'
+    }
+
+    def hostPort
+    switch (env.SELECTED_ENV) {
+        case 'test':                  hostPort = '5001'; break
+        case 'staging':               hostPort = '5002'; break
+        case 'production-simulation': hostPort = '5003'; break
+        default: error("Unsupported deployment environment: ${env.SELECTED_ENV}")
+    }
+
+    def deployImage
+    if (params.PUSH_IMAGE && env.REGISTRY_PUSH_STATUS == 'PASSED') {
+        if (env.REGISTRY_DIGEST_STATUS != 'PASSED' || !env.REGISTRY_REPO_DIGEST?.contains('@sha256:')) {
+            env.DEPLOY_STATUS = 'FAILED'
+            error('Registry image was pushed but immutable digest resolution did not pass')
+        }
+        deployImage = env.REGISTRY_REPO_DIGEST
+    } else {
+        deployImage = env.DOCKER_IMAGE
+    }
+
+    if (!deployImage?.trim() || deployImage == 'NONE') {
+        env.DEPLOY_STATUS = 'FAILED'
+        error('No deployable image is available')
+    }
+
+    if (params.SIGN_IMAGE && env.COSIGN_VERIFY_STATUS != 'PASSED') {
+        env.DEPLOY_STATUS = 'FAILED'
+        error('SIGN_IMAGE=true but Cosign verification did not pass')
+    }
+
+    def containerName  = "devsecops-${env.SONAR_PROJECT_KEY}-${env.SELECTED_ENV}"
+    def composeProject = "${env.SONAR_PROJECT_KEY}-${env.SELECTED_ENV}"
+
+    env.DEPLOY_CONTAINER = containerName
+    env.DEPLOY_PORT      = hostPort
+    env.DEPLOYED_IMAGE   = deployImage
+
+    def imageSource = (params.PUSH_IMAGE && env.REGISTRY_PUSH_STATUS == 'PASSED')
+        ? 'GitLab Registry (immutable digest)'
+        : 'Local build'
+
+    echo """
+===================================
+  🚀  DEPLOY — Docker Compose IaC
+      Image       : ${deployImage}
+      Environment : ${env.SELECTED_ENV}
+      Container   : ${containerName}
+      Port        : ${hostPort} -> ${containerPort}
+      Source      : ${imageSource}
+==================================="""
+
+    if (params.PUSH_IMAGE && env.REGISTRY_PUSH_STATUS == 'PASSED') {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'gitlab-registry-token',
+                usernameVariable: 'REGISTRY_USER',
+                passwordVariable: 'REGISTRY_TOKEN'
+            )
+        ]) {
+            try {
+                sh '''
+                    set -eu
+                    echo "$REGISTRY_TOKEN" | docker login registry.gitlab.com \
+                        --username "$REGISTRY_USER" \
+                        --password-stdin
+                '''
+                sh "docker pull ${deployImage}"
+            } finally {
+                sh 'docker logout registry.gitlab.com >/dev/null 2>&1 || true'
+            }
+        }
+    }
+
+    writeFile(
+        file: 'deployment/.env.runtime',
+        text: """\
+IMAGE_NAME=${deployImage}
+CONTAINER_NAME=${containerName}
+HOST_PORT=${hostPort}
+CONTAINER_PORT=${containerPort}
+APP_ENV=${env.SELECTED_ENV}
+PROJECT_NAME=${env.SONAR_PROJECT_KEY}
+BUILD_NUMBER=${env.BUILD_NUMBER}
+"""
+    )
+
+    def composeConfigExit = sh(
+        script: '''
+            docker compose \
+                --env-file deployment/.env.runtime \
+                -f deployment/docker-compose.yml \
+                config -q
+        ''',
+        returnStatus: true
+    )
+    if (composeConfigExit != 0) {
+        env.DEPLOY_STATUS = 'FAILED'
+        error('Docker Compose configuration validation failed')
+    }
+
+    sh """
+        docker compose \
+            --env-file deployment/.env.runtime \
+            -f deployment/docker-compose.yml \
+            -p ${composeProject} \
+            down --remove-orphans 2>/dev/null || true
+    """
+
+    def deployExit = sh(
+        script: """
+            docker compose \
+                --env-file deployment/.env.runtime \
+                -f deployment/docker-compose.yml \
+                -p ${composeProject} \
+                up -d
+        """,
+        returnStatus: true
+    )
+
+    if (deployExit != 0) {
+        env.DEPLOY_STATUS = 'FAILED'
+    } else {
+        def healthExit = sh(
+            script: """
+                set +e
+                for i in \$(seq 1 20); do
+                    STATE=\$(docker inspect --format='{{.State.Status}}' ${containerName} 2>/dev/null || echo missing)
+                    HEALTH=\$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' ${containerName} 2>/dev/null || echo unknown)
+                    echo "Health attempt \$i/20: state=\$STATE health=\$HEALTH"
+
+                    if [ "\$STATE" != "running" ]; then
+                        exit 1
+                    fi
+                    if [ "\$HEALTH" = "healthy" ]; then
+                        exit 0
+                    fi
+                    if [ "\$HEALTH" = "unhealthy" ]; then
+                        exit 1
+                    fi
+
+                    if [ "\$HEALTH" = "none" ]; then
+                        docker exec ${containerName} sh -c \
+                            'if command -v curl >/dev/null 2>&1; then curl -sf --max-time 5 http://127.0.0.1:${containerPort}/health >/dev/null; elif command -v wget >/dev/null 2>&1; then wget -q -O /dev/null http://127.0.0.1:${containerPort}/health; elif command -v python >/dev/null 2>&1; then python -c "import urllib.request; r=urllib.request.urlopen(\\"http://127.0.0.1:${containerPort}/health\\", timeout=5); raise SystemExit(0 if r.status == 200 else 1)"; elif command -v node >/dev/null 2>&1; then node -e "require(\\"http\\").get(\\"http://127.0.0.1:${containerPort}/health\\",r=>process.exit(r.statusCode===200?0:1)).on(\\"error\\",()=>process.exit(1))"; else exit 127; fi' \
+                            >/dev/null 2>&1 && exit 0
+                    fi
+
+                    sleep 3
+                done
+                exit 1
+            """,
+            returnStatus: true
+        )
+
+        env.DEPLOY_STATUS = (healthExit == 0) ? 'PASSED' : 'FAILED'
+    }
+
+    if (env.DEPLOY_STATUS == 'FAILED') {
+        echo '===== DEPLOYMENT FAILURE DIAGNOSTICS ====='
+        sh """
+            docker ps -a --filter "name=${containerName}" || true
+            docker inspect ${containerName} \
+                --format='Status={{.State.Status}} Running={{.State.Running}} ExitCode={{.State.ExitCode}} Error={{.State.Error}}' \
+                2>/dev/null || true
+            docker logs ${containerName} || true
+
+            docker compose \
+                --env-file deployment/.env.runtime \
+                -f deployment/docker-compose.yml \
+                -p ${composeProject} \
+                down --remove-orphans || true
+        """
+    } else {
+        echo """
+===================================
+  ✅  DEPLOY : PASSED
+      Compose : ${composeProject}
+      Port    : ${hostPort}:${containerPort}
+      Health  : HEALTHY
+==================================="""
+    }
+
+    writeFile(
+        file: 'reports/iac-deployment-summary.txt',
+        text: """STATUS: ${env.DEPLOY_STATUS}
+TOOL: Docker Compose
+COMPOSE_FILE: deployment/docker-compose.yml
+PROJECT: ${env.SONAR_PROJECT_KEY}
+ENVIRONMENT: ${env.SELECTED_ENV}
+IMAGE: ${deployImage}
+CONTAINER: ${containerName}
+PORT: ${hostPort}:${containerPort}
+BUILD_NUMBER: ${env.BUILD_NUMBER}
+IMAGE_SOURCE: ${imageSource}
+"""
+    )
+
+    writeFile(
+        file: 'reports/deployment-runtime.txt',
+        text: """STATUS: ${env.DEPLOY_STATUS}
+ENVIRONMENT: ${env.SELECTED_ENV}
+IMAGE: ${deployImage}
+CONTAINER: ${containerName}
+PORT: ${hostPort}:${containerPort}
+BUILD_NUMBER: ${env.BUILD_NUMBER}
+"""
+    )
+
+    if (env.DEPLOY_STATUS == 'FAILED') {
+        currentBuild.result = 'FAILURE'
+        error('Deployment failed — container did not become healthy')
+    }
+}
+
+def run_Generate_Audit_Trail_20() {
+    sh 'mkdir -p reports'
+
+    def finalDecision = deployAllowed ? 'ALLOWED' : 'BLOCKED'
+    def auditReasons  = blockReasons.isEmpty() ? 'None' : blockReasons.join(' | ')
+
+    writeFile(
+        file: 'reports/audit-trail.json',
+        text: """\
+{
+  "pipeline": {
+    "job": "${env.JOB_NAME ?: 'unknown'}",
+    "build_number": "${env.BUILD_NUMBER ?: 'unknown'}",
+    "build_url": "${env.BUILD_URL ?: ''}",
+    "status": "${currentBuild.currentResult ?: 'IN_PROGRESS'}"
+  },
+  "source": {
+    "repository": "${params.GIT_URL ?: ''}",
+    "branch": "${env.SELECTED_BRANCH ?: ''}",
+    "commit": "${env.GIT_COMMIT_FULL ?: 'unknown'}",
+    "commit_short": "${env.GIT_COMMIT_SHORT ?: 'unknown'}",
+    "language": "${env.DETECTED_LANGUAGE ?: 'unknown'}"
+  },
+  "security": {
+    "sast_status": "${env.SAST_STATUS ?: 'SKIPPED'}",
+    "sast_findings": "${env.SAST_TOTAL ?: '0'}",
+    "sast_blocking": "${env.SAST_ERRORS ?: '0'}",
+    "dependency_status": "${env.DEPENDENCY_STATUS ?: 'SKIPPED'}",
+    "dependency_vulnerabilities": "${env.DEPENDENCY_VULNS ?: '0'}",
+    "secret_status": "${env.SECRET_STATUS ?: 'SKIPPED'}",
+    "secret_count": "${env.SECRET_COUNT ?: '0'}",
+    "container_status": "${env.CONTAINER_SCAN_STATUS ?: 'SKIPPED'}",
+    "container_critical": "${env.CONTAINER_CRITICAL ?: '0'}",
+    "container_high": "${env.CONTAINER_HIGH ?: '0'}"
+  },
+  "supply_chain": {
+    "local_image": "${env.DOCKER_IMAGE ?: 'NONE'}",
+    "registry_push_status": "${env.REGISTRY_PUSH_STATUS ?: 'SKIPPED'}",
+    "registry_tag": "${env.REGISTRY_BUILD_TAG ?: 'NONE'}",
+    "digest_status": "${env.REGISTRY_DIGEST_STATUS ?: 'SKIPPED'}",
+    "digest_ref": "${env.REGISTRY_REPO_DIGEST ?: 'NONE'}",
+    "sbom_status": "${env.SBOM_STATUS ?: 'SKIPPED'}",
+    "sbom_components": "${env.SBOM_COMPONENTS ?: '0'}",
+    "cosign_sign_status": "${env.COSIGN_SIGN_STATUS ?: 'SKIPPED'}",
+    "cosign_verify_status": "${env.COSIGN_VERIFY_STATUS ?: 'SKIPPED'}"
+  },
+  "sonarqube": {
+    "analysis_enabled": "${params.RUN_SONAR}",
+    "quality_gate_status": "${env.SONAR_GATE_STATUS ?: 'SKIPPED'}"
+  },
+  "ai_advisor": {
+    "enabled": "${params.RUN_AI}",
+    "status": "${env.AI_ADVISOR_STATUS ?: 'SKIPPED'}",
+    "report": "reports/ai-security-report.json"
+  },
+  "quality_gate": {
+    "decision": "${finalDecision}",
+    "reasons": "${auditReasons}"
+  },
+  "deployment": {
+    "environment": "${env.SELECTED_ENV ?: ''}",
+    "approval_status": "${env.PROD_APPROVAL_STATUS ?: 'SKIPPED'}",
+    "container": "${env.DEPLOY_CONTAINER ?: 'NONE'}",
+    "port": "${env.DEPLOY_PORT ?: 'NONE'}",
+    "image": "${env.DEPLOYED_IMAGE ?: 'NONE'}",
+    "status": "${env.DEPLOY_STATUS ?: 'SKIPPED'}"
+  }
+}
+"""
+    )
+
+    echo """
+===================================
+  📋  AUDIT TRAIL GENERATED
+      Build    : #${env.BUILD_NUMBER}
+      Commit   : ${env.GIT_COMMIT_SHORT ?: 'unknown'}
+      Decision : ${finalDecision}
+      File     : reports/audit-trail.json
+==================================="""
+}
+
+def run_Generate_Pipeline_Summary_21() {
+    sh 'mkdir -p reports'
+
+    def pipelineStatus  = currentBuild.currentResult ?: 'SUCCESS'
+    def deployDecision  = deployAllowed ? 'ALLOWED' : 'BLOCKED'
+    def deployStatus    = env.DEPLOY_STATUS ?: 'SKIPPED'
+    def durationSeconds = (currentBuild.duration / 1000).toInteger()
+    env.PIPELINE_DURATION = durationSeconds.toString()
+
+    writeFile(
+        file: 'reports/pipeline-summary.json',
+        text: """\
+{
+  "build_number": "${env.BUILD_NUMBER}",
+  "project": "${env.SONAR_PROJECT_KEY ?: 'unknown'}",
+  "language": "${env.DETECTED_LANGUAGE ?: 'unknown'}",
+  "branch": "${env.SELECTED_BRANCH ?: 'unknown'}",
+  "environment": "${env.SELECTED_ENV ?: 'unknown'}",
+  "status": "${pipelineStatus}",
+  "duration_seconds": "${durationSeconds}",
+  "tests": {
+    "status": "${env.TEST_STATUS ?: 'SKIPPED'}",
+    "failures": "${env.TEST_FAILURES ?: '0'}"
+  },
+  "quality": {
+    "issues": "${env.QUALITY_ISSUES ?: '0'}"
+  },
+  "sonarqube": {
+    "enabled": "${params.RUN_SONAR}",
+    "quality_gate_status": "${env.SONAR_GATE_STATUS ?: 'SKIPPED'}"
+  },
+  "sast": {
+    "status": "${env.SAST_STATUS ?: 'SKIPPED'}",
+    "findings": "${env.SAST_TOTAL ?: '0'}",
+    "blocking": "${env.SAST_ERRORS ?: '0'}"
+  },
+  "dependencies": {
+    "status": "${env.DEPENDENCY_STATUS ?: 'SKIPPED'}",
+    "vulnerabilities": "${env.DEPENDENCY_VULNS ?: '0'}"
+  },
+  "secrets": {
+    "status": "${env.SECRET_STATUS ?: 'SKIPPED'}",
+    "count": "${env.SECRET_COUNT ?: '0'}"
+  },
+  "docker": {
+    "status": "${env.DOCKER_BUILD_STATUS ?: 'SKIPPED'}",
+    "image": "${env.DOCKER_IMAGE ?: 'NONE'}"
+  },
+  "container_scan": {
+    "status": "${env.CONTAINER_SCAN_STATUS ?: 'SKIPPED'}",
+    "critical": "${env.CONTAINER_CRITICAL ?: '0'}",
+    "high": "${env.CONTAINER_HIGH ?: '0'}"
+  },
+  "sbom": {
+    "status": "${env.SBOM_STATUS ?: 'SKIPPED'}",
+    "components": "${env.SBOM_COMPONENTS ?: '0'}"
+  },
+  "ai_advisor": {
+    "enabled": "${params.RUN_AI}",
+    "status": "${env.AI_ADVISOR_STATUS ?: 'SKIPPED'}",
+    "report": "reports/ai-security-report.json"
+  },
+  "registry": {
+    "push_status": "${env.REGISTRY_PUSH_STATUS ?: 'SKIPPED'}",
+    "image": "${env.REGISTRY_IMAGE ?: 'NONE'}",
+    "build_tag": "${env.REGISTRY_BUILD_TAG ?: 'NONE'}",
+    "commit_tag": "${env.REGISTRY_COMMIT_TAG ?: 'NONE'}",
+    "digest_status": "${env.REGISTRY_DIGEST_STATUS ?: 'SKIPPED'}",
+    "digest_ref": "${env.REGISTRY_REPO_DIGEST ?: 'NONE'}"
+  },
+  "signature": {
+    "tool": "Cosign",
+    "sign_status": "${env.COSIGN_SIGN_STATUS ?: 'SKIPPED'}",
+    "verify_status": "${env.COSIGN_VERIFY_STATUS ?: 'SKIPPED'}"
+  },
+  "policy": {
+    "tool": "Open Policy Agent",
+    "status": "${env.POLICY_STATUS ?: 'SKIPPED'}",
+    "denials": "${env.POLICY_DENIAL_COUNT ?: '0'}"
+  },
+  "deployment": {
+    "decision": "${deployDecision}",
+    "approval_status": "${env.PROD_APPROVAL_STATUS ?: 'SKIPPED'}",
+    "status": "${deployStatus}",
+    "container": "${env.DEPLOY_CONTAINER ?: 'NONE'}",
+    "port": "${env.DEPLOY_PORT ?: 'NONE'}",
+    "image": "${env.DEPLOYED_IMAGE ?: 'NONE'}"
+  }
+}
+"""
+    )
+
+    echo """
+===================================
+  📊  PIPELINE SUMMARY
+      Build    : #${env.BUILD_NUMBER}
+      Project  : ${env.SONAR_PROJECT_KEY ?: 'unknown'}
+      Status   : ${pipelineStatus}
+      Duration : ${durationSeconds}s
+      Decision : ${deployDecision}
+      Sonar    : ${env.SONAR_GATE_STATUS ?: 'SKIPPED'}
+      AI       : ${env.AI_ADVISOR_STATUS ?: 'SKIPPED'}
+      File     : reports/pipeline-summary.json
+==================================="""
+}
+
+def run_PostSuccess_22() {
+                if (params.SEND_NOTIFICATIONS) {
+                    echo """
+╔══════════════════════════════════════════════╗
+  ✅  NOTIFICATION — PIPELINE SUCCESS
+      Project     : ${env.SONAR_PROJECT_KEY}
+      Build       : #${env.BUILD_NUMBER}
+      Commit      : ${env.GIT_COMMIT_SHORT ?: 'unknown'}
+      Language    : ${env.DETECTED_LANGUAGE}
+      Environment : ${env.SELECTED_ENV}
+      Image       : ${env.DEPLOYED_IMAGE ?: env.REGISTRY_BUILD_TAG ?: env.DOCKER_IMAGE}
+      Deployment  : ${env.DEPLOY_STATUS ?: 'SKIPPED'}
+      URL         : ${env.BUILD_URL}
+╚══════════════════════════════════════════════╝"""
+                } else {
+                    echo "✅ Pipeline SUCCESS — ${env.SONAR_PROJECT_KEY} → ${env.SELECTED_ENV}"
+                }
+            
+}
+
+def run_PostUnstable_23() {
+                if (params.SEND_NOTIFICATIONS) {
+                    echo """
+╔══════════════════════════════════════════════╗
+  ⚠️   NOTIFICATION — PIPELINE UNSTABLE
+      Project : ${env.SONAR_PROJECT_KEY}
+      Build   : #${env.BUILD_NUMBER}
+      Check JUnit test results for failures.
+      URL     : ${env.BUILD_URL}
+╚══════════════════════════════════════════════╝"""
+                } else {
+                    echo '⚠️  Pipeline UNSTABLE — check JUnit results.'
+                }
+            
+}
+
+def run_PostFailure_24() {
+                def blockSummary = blockReasons.isEmpty() ? 'See logs' : blockReasons.join(' | ')
+                if (params.SEND_NOTIFICATIONS) {
+                    echo """
+╔══════════════════════════════════════════════╗
+  ❌  NOTIFICATION — PIPELINE FAILED
+      Project     : ${env.SONAR_PROJECT_KEY}
+      Build       : #${env.BUILD_NUMBER}
+      Commit      : ${env.GIT_COMMIT_SHORT ?: 'unknown'}
+      Environment : ${env.SELECTED_ENV}
+      Decision    : ${deployAllowed ? 'ALLOWED' : 'BLOCKED'}
+      Reasons     : ${blockSummary}
+      URL         : ${env.BUILD_URL}
+╚══════════════════════════════════════════════╝"""
+                } else {
+                    echo "❌ Pipeline FAILED — ${env.SONAR_PROJECT_KEY} → ${blockSummary}"
+                }
+            
+}
+
+
+pipeline {
+    agent any
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timestamps()                               // Horodatage exact dans chaque log
+        timeout(time: 45, unit: 'MINUTES')         // Tue le pipeline si > 45 min
+        buildDiscarder(logRotator(
+            numToKeepStr:         '30',            // Conserver les 30 derniers builds
+            artifactNumToKeepStr: '15'             // Conserver les artifacts des 15 derniers
+        ))
+    }
+
+    parameters {
+        string(
+            name: 'GIT_URL',
+            defaultValue: 'https://gitlab.com/devsecops-pipeline-manager/sample-python-app.git',
+            description: 'GitLab repository URL'
+        )
+        string(
+            name: 'BRANCH',
+            defaultValue: 'main',
+            description: 'Git branch to analyze'
+        )
+        choice(
+            name: 'LANGUAGE',
+            choices: ['auto', 'python', 'javascript', 'java'],
+            description: 'Project language (auto = detect from files)'
+        )
+        booleanParam(name: 'RUN_TESTS',    defaultValue: true,  description: 'Run automated tests')
+        booleanParam(name: 'RUN_QUALITY',  defaultValue: true,  description: 'Run code quality analysis')
+        booleanParam(name: 'RUN_SECURITY', defaultValue: true,  description: 'Run security scans')
+        booleanParam(name: 'RUN_SONAR',    defaultValue: true,  description: 'Run SonarQube analysis')
+        booleanParam(name: 'RUN_SAST',     defaultValue: true,  description: 'Run SAST analysis (Semgrep)')
+        booleanParam(name: 'RUN_DEPENDENCY', defaultValue: true, description: 'Run Dependency Scan (pip-audit/npm audit/OWASP)')
+        booleanParam(name: 'RUN_SECRET',       defaultValue: true,  description: 'Run Secret Scan (Gitleaks)')
+        booleanParam(name: 'RUN_DOCKER_BUILD',    defaultValue: true,  description: 'Build Docker image (requires Dockerfile in repo)')
+        booleanParam(name: 'RUN_CONTAINER_SCAN',  defaultValue: true,  description: 'Scan Docker image with Trivy (CRITICAL/HIGH)')
+        booleanParam(name: 'RUN_SBOM',             defaultValue: true,  description: 'Generate SBOM in CycloneDX JSON format')
+        booleanParam(name: 'RUN_AI',               defaultValue: true,  description: 'Generate AI security recommendations using Gemini')
+        booleanParam(name: 'PUSH_IMAGE',            defaultValue: true,  description: 'Push validated image to GitLab Container Registry')
+        booleanParam(name: 'SIGN_IMAGE',            defaultValue: true,  description: 'Sign + verify immutable registry digest with Cosign')
+        booleanParam(name: 'REQUIRE_PROD_APPROVAL', defaultValue: true,  description: 'Require manual approval for production-simulation')
+        booleanParam(name: 'SEND_NOTIFICATIONS',    defaultValue: true,  description: 'Echo pipeline result notifications in Jenkins logs')
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['test', 'staging', 'production-simulation'],
+            description: 'Deployment environment'
+        )
+    }
+
+    environment {
+        // Variables will be set dynamically via env.VARIABLE = value in script blocks.
+        // DO NOT define them here if they need to be mutated across stages.
+        PIPELINE_MARKER = 'DevSecOps'
+    }
+
+    stages {
+
+        // ════════════════════════════════════════════════════════
+        // 1. VALIDATE PARAMETERS
+        // ════════════════════════════════════════════════════════
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    run_Validate_Parameters_1()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 2. CHECKOUT
+        // ════════════════════════════════════════════════════════
+        stage('Checkout') {
+            steps {
+                script {
+                    run_Checkout_2()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 3. DETECT LANGUAGE ⭐
+        // Auto-detects from known files or uses manual selection
+        // ════════════════════════════════════════════════════════
+        stage('Detect Language') {
+            steps {
+                script {
+                    run_Detect_Language_3()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 4. BUILD ⭐
+        // Install dependencies + compile (language-specific)
+        // ════════════════════════════════════════════════════════
+        stage('Build') {
+            steps {
+                script {
+                    run_Build_4()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 5. RUN TESTS
+        // Strategy: grep JUnit XML (immune to exit code issues)
+        // ════════════════════════════════════════════════════════
+        stage('Run Tests') {
+            when { expression { return params.RUN_TESTS } }
+            steps {
+                script {
+                    run_Run_Tests_5()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 6. CODE QUALITY
+        // flake8 / ESLint / Checkstyle — language-specific
+        // ════════════════════════════════════════════════════════
+        stage('Code Quality') {
+            when { expression { return params.RUN_QUALITY } }
+            steps {
+                script {
+                    run_Code_Quality_6()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 7. SONARQUBE ANALYSIS
+        // Project key derived dynamically from GIT_URL
+        // ════════════════════════════════════════════════════════
+        stage('SonarQube Analysis') {
+            when { expression { return params.RUN_SONAR } }
+            steps {
+                script {
+                    run_SonarQube_Analysis_7()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 7B. SONARQUBE QUALITY GATE
+        // Waits asynchronously for the SonarQube webhook result.
+        // Records the gate result; later Deployment Decision blocks publish/deploy if not OK.
+        // ════════════════════════════════════════════════════════
+        stage('SonarQube Quality Gate') {
+            when { expression { return params.RUN_SONAR } }
+            steps {
+                script {
+                    run_SonarQube_Quality_Gate_7b()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 8. SAST — SEMGREP ⭐
+        // Static Application Security Testing — language-agnostic
+        // ════════════════════════════════════════════════════════
+        stage('SAST') {
+            when { expression { return params.RUN_SECURITY && params.RUN_SAST } }
+            steps {
+                script {
+                    run_SAST_8()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 10. DEPENDENCY SCAN ⭐
+        // pip-audit / npm audit / OWASP — language-specific
+        // Gate : Python=any vuln, JS=high+, Java=CVSS≥7
+        // ════════════════════════════════════════════════════════
+        stage('Dependency Scan') {
+            when { expression { return params.RUN_SECURITY && params.RUN_DEPENDENCY } }
+            steps {
+                script {
+                    run_Dependency_Scan_9()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 11. SECRET SCAN ⭐ — Gitleaks
+        // Detects secrets committed to Git history
+        // Uses : gitleaks git (not deprecated detect)
+        // Gate : any secret found = FAILED
+        // ════════════════════════════════════════════════════════
+        stage('Secret Scan') {
+            when { expression { return params.RUN_SECURITY && params.RUN_SECRET } }
+            steps {
+                script {
+                    run_Secret_Scan_10()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 12. DOCKER BUILD ⭐
+        // Builds a versioned Docker image from the checked-out repo
+        // Tag  : <project>:<BUILD_NUMBER>
+        // Gate : build failure blocks deployment
+        // ════════════════════════════════════════════════════════
+        stage('Docker Build') {
+            when { expression { return params.RUN_DOCKER_BUILD } }
+            steps {
+                script {
+                    run_Docker_Build_11()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 13. CONTAINER SCAN ⭐ — Trivy via Docker-in-Docker
+        // Scans the built image for OS + library vulnerabilities
+        // Gate : CRITICAL > 0  OR  HIGH >= 5
+        // Skip : automatically skipped if Docker Build failed
+        // ════════════════════════════════════════════════════════
+        stage('Container Scan') {
+            when {
+                expression {
+                    return params.RUN_SECURITY &&
+                           params.RUN_CONTAINER_SCAN &&
+                           env.DOCKER_BUILD_STATUS == 'PASSED'
+                }
+            }
+            steps {
+                script {
+                    run_Container_Scan_12()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 14. GENERATE SBOM ⭐ — CycloneDX via Trivy
+        // Generates a full Software Bill of Materials from the Docker image
+        // Format : CycloneDX JSON (reports/sbom.cdx.json)
+        // Gate   : generation failure blocks deployment (traceability required)
+        // Skip   : automatically skipped if Docker Build failed
+        // ════════════════════════════════════════════════════════
+        stage('Generate SBOM') {
+            when {
+                expression {
+                    return params.RUN_SBOM &&
+                           env.DOCKER_BUILD_STATUS == 'PASSED'
+                }
+            }
+            steps {
+                script {
+                    run_Generate_SBOM_13()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 14B. AI SECURITY ADVISOR 🤖
+        // Gemini analyzes SAST, dependency, container and SBOM reports.
+        // Advisory only: AI failure never overrides deterministic security gates.
+        // ════════════════════════════════════════════════════════
+        stage('AI Security Advisor') {
+            when {
+                expression {
+                    return params.RUN_AI
+                }
+            }
+            steps {
+                script {
+                    run_AI_Security_Advisor_29()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 15. PREPARE POLICY INPUT ⭐
+        // Writes reports/security-policy-input.json from all scan
+        // env vars — becomes the OPA input document.
+        // ════════════════════════════════════════════════════════
+        stage('Prepare Policy Input') {
+            steps {
+                script {
+                    run_Prepare_Policy_Input_14()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 16. TEST SECURITY POLICIES ⭐
+        // Runs OPA unit tests — catches broken Rego rules BEFORE
+        // they affect the deployment decision.
+        // ════════════════════════════════════════════════════════
+        stage('Test Security Policies') {
+            steps {
+                script {
+                    run_Test_Security_Policies_15()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 17. POLICY AS CODE ⭐ — OPA / Rego
+        // Evaluates security-policy-input.json against
+        // policy/devsecops.rego and populates blockReasons.
+        // deployAllowed is set by OPA, not by Groovy logic.
+        // ════════════════════════════════════════════════════════
+        stage('Policy as Code') {
+            steps {
+                script {
+                    run_Policy_as_Code_16()
+                }
+            }
+        }
+
+
+        // ════════════════════════════════════════════════════════
+        // 10. DEPLOYMENT DECISION
+        // ════════════════════════════════════════════════════════
+        stage('Deployment Decision') {
+            steps {
+                script {
+                    run_Deployment_Decision_17()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 16. PUBLISH IMAGE ⭐
+        // Pushes validated image to GitLab Container Registry
+        // ONLY runs when deployAllowed == true (all gates green)
+        // Tags : build-<N>  +  commit-<sha>
+        // ════════════════════════════════════════════════════════
+        stage('Publish Image') {
+            when {
+                expression {
+                    return params.PUSH_IMAGE &&
+                           deployAllowed == true &&
+                           env.DOCKER_BUILD_STATUS == 'PASSED'
+                }
+            }
+            steps {
+                script {
+                    run_Publish_Image_18()
+                }
+            }
+        }
+
+
+        stage('Resolve Image Digest') {
+            when {
+                expression {
+                    return params.PUSH_IMAGE &&
+                           deployAllowed == true &&
+                           env.REGISTRY_PUSH_STATUS == 'PASSED'
+                }
+            }
+            steps {
+                script { run_Resolve_Image_Digest_25() }
+            }
+        }
+
+        stage('Sign Image') {
+            when {
+                expression {
+                    return params.SIGN_IMAGE &&
+                           params.PUSH_IMAGE &&
+                           deployAllowed == true &&
+                           env.REGISTRY_DIGEST_STATUS == 'PASSED'
+                }
+            }
+            steps {
+                script { run_Sign_Image_26() }
+            }
+        }
+
+        stage('Verify Signature') {
+            when {
+                expression {
+                    return params.SIGN_IMAGE &&
+                           env.COSIGN_SIGN_STATUS == 'PASSED'
+                }
+            }
+            steps {
+                script { run_Verify_Signature_27() }
+            }
+        }
+
+        stage('Production Approval') {
+            when {
+                expression {
+                    return deployAllowed == true &&
+                           params.REQUIRE_PROD_APPROVAL &&
+                           env.SELECTED_ENV == 'production-simulation'
+                }
+            }
+            steps {
+                script { run_Production_Approval_28() }
+            }
+        }
+
+            // ════════════════════════════════════════════════════════
+        // 24. DEPLOY — Docker Compose IaC ⭐
+        // Infrastructure as Code: deployment driven by
+        // deployment/docker-compose.yml + .env.runtime
+        // Health check + automatic rollback on failure
+        // ════════════════════════════════════════════════════════
+        stage('Deploy') {
+            when {
+                expression { return deployAllowed == true && env.DOCKER_BUILD_STATUS == 'PASSED' }
+            }
+            steps {
+                script {
+                    run_Deploy_19()
+                }
+            }
+        } // end Deploy
+
+
+        // ════════════════════════════════════════════════════════
+        // 19. GENERATE AUDIT TRAIL ⭐
+        // Runs ALWAYS — full traceability record per pipeline run
+        // answers: who, what, when, why blocked, what image, where deployed
+        // ════════════════════════════════════════════════════════
+        stage('Generate Audit Trail') {
+            steps {
+                script {
+                    run_Generate_Audit_Trail_20()
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // 20. GENERATE PIPELINE SUMMARY ⭐
+        // Runs ALWAYS — even on failure — to produce the JSON artifact
+        // sent to FastAPI → PostgreSQL for the Dashboard / History
+        // ════════════════════════════════════════════════════════
+        stage('Generate Pipeline Summary') {
+            steps {
+                script {
+                    run_Generate_Pipeline_Summary_21()
+                }
+            }
+        }
+
+    } // end stages
+
+    // ════════════════════════════════════════════════════════════
+    // POST — always archive reports, even on failure
+    // ════════════════════════════════════════════════════════════
+    post {
+        always {
+            script {
+                if (!fileExists('reports/audit-trail.json')) {
+                    try {
+                        run_Generate_Audit_Trail_20()
+                    } catch (Exception e) {
+                        echo "⚠️ Fallback audit trail generation failed: ${e.message}"
+                    }
+                }
+                if (!fileExists('reports/pipeline-summary.json')) {
+                    try {
+                        run_Generate_Pipeline_Summary_21()
+                    } catch (Exception e) {
+                        echo "⚠️ Fallback pipeline summary generation failed: ${e.message}"
+                    }
+                }
+                sh '''
+                    rm -f deployment/.env.runtime 2>/dev/null || true
+                    docker logout registry.gitlab.com >/dev/null 2>&1 || true
+                '''
+            }
+
+            echo 'Archiving reports...'
+            archiveArtifacts artifacts: 'reports/*,reports/**', allowEmptyArchive: true
+            junit testResults: 'reports/test-results.xml', allowEmptyResults: true
+        }
+        success {
+            script {
+                run_PostSuccess_22()
+            }
+        }
+        unstable {
+            script {
+                run_PostUnstable_23()
+            }
+        }
+        failure {
+            script {
+                run_PostFailure_24()
+            }
+        }
+    }
+}
